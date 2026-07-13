@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# arxos-run-tool <toolname> - launch an ARXOS arsenal tool by name.
+#   installed      -> run it (a GUI tool launches directly; a CLI tool opens a terminal
+#                     showing its --help and drops you into a shell ready to use it)
+#   not installed  -> open a terminal offering to install it (arx install <tool>), then launch
+# Every Weapons-menu entry calls this, so the menu lists ALL tools from tools.db and installs
+# on demand - "in the system: run it; missing: offer to install it".
+set -u
+tool="${1:-}"; [ -z "$tool" ] && exit 1
+DB=/usr/share/arxos/tools.db
+desc=$(awk -F'|' -v t="$tool" '$1==t{print $5; exit}' "$DB" 2>/dev/null)
+TE=$(command -v xfce4-terminal || command -v x-terminal-emulator || echo xterm)
+
+pkg_installed(){ /usr/bin/pacman -Qq "$1" >/dev/null 2>&1; }
+has_gui(){ /usr/bin/pacman -Ql "$1" 2>/dev/null | grep -qE '/usr/share/applications/[^/]+\.desktop$'; }
+# the tool's runnable command: the matching binary if the name resolves, else the first
+# real executable the package ships.
+main_bin(){
+  local b; b=$(command -v "$1" 2>/dev/null); [ -n "$b" ] && { printf '%s' "$b"; return; }
+  /usr/bin/pacman -Ql "$1" 2>/dev/null | awk '$2 ~ /\/(s?bin)\/[^/]+$/{print $2}' | head -1
+}
+
+if pkg_installed "$tool" || command -v "$tool" >/dev/null 2>&1; then
+  run=$(main_bin "$tool"); [ -z "$run" ] && run="$tool"
+  if has_gui "$tool"; then
+    setsid "$run" >/dev/null 2>&1 &                 # GUI tool: launch directly, no terminal
+  else
+    setsid env ARXTOOL="$tool" ARXDESC="$desc" ARXRUN="$run" "$TE" \
+      --title="ARXOS · $tool" -x bash -lc '
+        printf "\n  \033[1;38;5;208m%s\033[0m   \033[90m%s\033[0m\n\n" "$ARXTOOL" "$ARXDESC"
+        "$ARXRUN" --help 2>&1 | head -40 || true
+        printf "\n  \033[38;5;208mready\033[0m - run:  %s [options]\n\n" "$(basename "$ARXRUN")"
+        exec bash' >/dev/null 2>&1 &
+  fi
+else
+  setsid env ARXTOOL="$tool" ARXDESC="$desc" "$TE" \
+    --title="ARXOS · install $tool" -x bash -lc '
+      printf "\n  \033[1;38;5;208m%s\033[0m is not installed.\n  \033[90m%s\033[0m\n\n" "$ARXTOOL" "$ARXDESC"
+      read -rp "  install it now? [Y/n] " a
+      case "${a:-y}" in [Nn]*) exit 0;; esac
+      if arx install "$ARXTOOL"; then
+        echo; read -rp "  installed - press enter to launch it..."
+        setsid arxos-run-tool "$ARXTOOL" >/dev/null 2>&1
+      else
+        echo; read -rp "  press enter to close..."
+      fi' >/dev/null 2>&1 &
+fi

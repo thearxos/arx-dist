@@ -1,0 +1,1361 @@
+#!/usr/bin/env bash
+# arx - ARXOS unified package manager
+# A tiny, quiet TUI over pacman/yay. All repo/sync noise is suppressed and
+# replaced with a clean phase-aware spinner; errors are detected and shown
+# as a single readable line.
+#
+#   arx update            full system upgrade
+#   arx install <pkg...>  install package(s)
+#   arx remove  <pkg...>  remove package(s) + unneeded deps
+#   arx search  <term>    search the repositories
+#   arx info    <pkg>     package details
+#   arx clean             trim the package cache
+#   arx orphans           remove orphaned dependencies
+#   arx aur <pkg...>      install from the AUR (yay)
+#   flags: -y/--yes assume yes   |   arx <pkg> installs directly
+
+set -o pipefail
+case ${TERM:-} in ""|unknown|dumb|network) TERM=xterm-256color ;; esac; export TERM   # GUI launch can hand us an empty/invalid TERM ("unknown"); keep tput quiet
+case "${1:-}" in --version|-V) echo "arx 0.0.1 (ARXOS)"; exit 0 ;; esac
+
+GB=$'\033[1;38;5;220m'; CB=$'\033[1;38;5;45m'; C=$'\033[38;5;45m'
+GR=$'\033[1;32m'; RD=$'\033[1;31m'; DM=$'\033[90m'; BD=$'\033[1m'; RS=$'\033[0m'; OR=$'\033[38;5;208m'
+
+LOG=$(mktemp /tmp/arx.XXXXXX); trap 'rm -f "$LOG"; [ -n "$_ARX_KA" ] && kill "$_ARX_KA" 2>/dev/null; [ -t 1 ] && printf "\033[?25h" 2>/dev/null' EXIT INT TERM
+SPIN=('|' '/' '-' '\')
+VERSION="0.0.1"
+ASSUME_YES=""
+
+_title(){ printf "\n  ${GB}arx${RS} ${DM}::${RS} ${BD}%s${RS}" "$1"; [ -n "${2:-}" ] && printf " ${C}%s${RS}" "$2"; printf "\n\n"; }
+_ok(){  printf "  ${GR}>>${RS} %s\n\n" "$1"; }
+_no(){  printf "  ${RD}xx${RS} %s\n\n" "$1"; }
+_dim(){ printf "  ${DM}%s${RS}\n" "$1"; }
+
+# arx-core: native Rust/libalpm accelerator for read-only queries (search/list/outdated).
+# It links the same libalpm ARXOS ships, so its output is byte-for-byte what pacman sees,
+# just ~17x faster (no fork+parse of pacman's text). Absent -> every caller falls back to
+# pacman. $ARXCORE holds the resolved path once probed.
+ARXCORE=""; _ARXCORE_CK=0
+_arxcore(){
+  [ "$_ARXCORE_CK" = 1 ] && { [ -n "$ARXCORE" ]; return; }
+  _ARXCORE_CK=1; local c
+  for c in /usr/lib/arxos/arx-core /usr/local/lib/arxos/arx-core "$(command -v arx-core 2>/dev/null)"; do
+    [ -n "$c" ] && [ -x "$c" ] && "$c" --selftest >/dev/null 2>&1 && { ARXCORE="$c"; return 0; }
+  done
+  return 1
+}
+
+# Average download speed from a "123.4 MiB" size + elapsed seconds.
+_speed(){
+  local sz="$1" t="$2" num unit
+  [ -z "$sz" ] && return; [ "${t:-0}" -le 0 ] && return
+  num=$(printf '%s' "$sz" | grep -oE '[0-9.]+'); unit=$(printf '%s' "$sz" | grep -oE '[KMG]iB')
+  awk -v n="$num" -v u="$unit" -v t="$t" 'BEGIN{m=(u=="GiB")?n*1024:(u=="KiB")?n/1024:n; if(t>0){s=m/t; if(s>=1)printf "%.1f MiB/s",s; else printf "%.0f KiB/s",s*1024}}'
+}
+
+# Clean one-line summary: packages · size · speed · time.
+_summary(){ # headline  n
+  # operation breakdown straight from the transaction log
+  local up ins rem rei b=() x brk=""
+  up=$(grep -cE '^\([0-9]+/[0-9]+\) upgrading'     "$LOG" 2>/dev/null)
+  ins=$(grep -cE '^\([0-9]+/[0-9]+\) installing'   "$LOG" 2>/dev/null)
+  rem=$(grep -cE '^\([0-9]+/[0-9]+\) removing'     "$LOG" 2>/dev/null)
+  rei=$(grep -cE '^\([0-9]+/[0-9]+\) reinstalling' "$LOG" 2>/dev/null)
+  [ "${up:-0}"  -gt 0 ] && b+=("${up} upgraded")
+  [ "${ins:-0}" -gt 0 ] && b+=("${ins} installed")
+  [ "${rem:-0}" -gt 0 ] && b+=("${rem} removed")
+  [ "${rei:-0}" -gt 0 ] && b+=("${rei} reinstalled")
+  for x in "${b[@]}"; do [ -n "$brk" ] && brk="$brk · $x" || brk="$x"; done
+  local parts="${brk:-${2} package(s)}"
+  [ "${ARX_HEALED:-0}" -gt 0 ] && parts="$parts · ${ARX_HEALED} self-healed"
+  [ -n "$ARX_DLSIZE" ] && parts="$parts · $ARX_DLSIZE"
+  [ -n "$ARX_SPEED"  ] && parts="$parts · $ARX_SPEED"
+  [ "${ARX_DLTIME:-0}" -gt 0 ] && parts="$parts · ${ARX_DLTIME}s"
+  printf "  ${GR}>>${RS} %s\n     ${DM}%s${RS}\n\n" "$1" "$parts"
+}
+
+# Block progress bar: _bar <pct> [width]
+# Plymouth-style segmented loader bar (flat segments, ArxOS orange fill on a dim track).
+#   _bar <pct> <width>          determinate: fills proportionally to <pct>
+#   _bar -1   <width> <tick>    indeterminate: a lit window sweeps back and forth
+_bar(){
+  local p=${1:-0} w=${2:-18} tick=${3:-0} i lo hi out="" on=-1
+  if [ "$p" -lt 0 ] 2>/dev/null; then
+    local win=$(( w*3/10 )); [ "$win" -lt 2 ] && win=2
+    local span=$(( (w-win)*2 )); [ "$span" -lt 1 ] && span=1
+    local pos=$(( tick % span )); [ "$pos" -gt $((w-win)) ] && pos=$(( span - pos ))
+    lo=$pos; hi=$((pos+win))
+  else
+    [ "$p" -gt 100 ] 2>/dev/null && p=100; [ "$p" -lt 0 ] 2>/dev/null && p=0
+    lo=0; hi=$(( p * w / 100 ))
+  fi
+  # Use block-element glyphs (█ / ░): single-width and present in virtually every terminal
+  # font. The parallelogram segments (▰ ▱) are prettier but many fonts lack them and
+  # substitute a DOUBLE-WIDTH diamond, which overflows the line, breaks the \r redraw, and
+  # piles the loader down the screen.
+  for ((i=0;i<w;i++)); do
+    if [ "$i" -ge "$lo" ] && [ "$i" -lt "$hi" ]; then
+      [ "$on" != 1 ] && { out+="$OR"; on=1; }; out+="█"
+    else
+      [ "$on" != 0 ] && { out+="$DM"; on=0; }; out+="░"
+    fi
+  done
+  printf '%s%s' "$out" "$RS"
+}
+
+# Print a package list in aligned columns that fit the terminal, so every package is
+# visible at a glance (no "...and N more" truncation) before you confirm an action.
+_pkgcols(){ # newline-separated names
+  local Wc=${COLUMNS:-0}; [ "$Wc" -gt 0 ] 2>/dev/null || Wc=$(tput cols 2>/dev/null || echo 100)
+  printf '%s\n' "$1" | awk -v W="$Wc" -v OR="$OR" -v DM="$DM" -v Z="$RS" '
+    { g[NR]=$1; if(length($1)>m) m=length($1) }
+    END{
+      if(NR==0) exit
+      cell=m+4; if(cell<10) cell=10
+      cols=int((W-3)/cell); if(cols<1) cols=1
+      rows=int((NR+cols-1)/cols)
+      for(r=0;r<rows;r++){
+        printf "   "
+        for(c=0;c<cols;c++){ idx=c*rows+r+1; if(idx<=NR) printf " %s+%s %s%-*s%s", OR, Z, DM, m, g[idx], Z }
+        printf "\n"
+      }
+    }'
+}
+
+# Modern live loader: runs the op in a PTY so pacman emits real per-package
+# progress, and renders one clean line — bar · % · current package · size · speed · X/N.
+# Records size/time/speed into ARX_DLSIZE/ARX_DLTIME/ARX_SPEED for the summary.
+_load(){ # label cmd...
+  local label="$1"; shift
+  local cmdq; printf -v cmdq '%q ' "$@"   # shell-quote the final command so the loader's sh -c never re-expands globs (e.g. --overwrite '/path/*')
+  ARX_DLSIZE=""; ARX_DLTIME=0; ARX_SPEED=""
+  : > "$LOG"
+  if [ ! -t 1 ]; then
+    # No TTY (ARXOS Control Center GUI / pipe): no spinner, and crucially NO raw
+    # pacman scrollback. Render a clean, change-gated loader — one readable line
+    # per state change (downloading X/N · upgrading pkg X/N) instead of thousands
+    # of progress-bar frames.
+    printf '  >> %s\n' "$label"
+    script -qefc "$cmdq" "$LOG" </dev/null >/dev/null 2>&1 & local pid=$!
+    local last="" N="" t_dl0=0 t_dl1=0 now=""
+    while kill -0 "$pid" 2>/dev/null; do
+      local t; t=$(tail -c 6000 "$LOG" 2>/dev/null | sed 's/\x1b\[[0-9;?]*[a-zA-Z]//g; s/\r/\n/g')
+      [ -z "$N" ] && N=$(printf '%s' "$t" | grep -oE 'Packages \(([0-9]+)\)' | grep -oE '[0-9]+' | tail -1)
+      local s2; s2=$(printf '%s' "$t" | grep -oiE 'Total Download Size:[[:space:]]*[0-9.]+ [KMG]iB' | tail -1 | grep -oiE '[0-9.]+ [KMG]iB')
+      [ -n "$s2" ] && ARX_DLSIZE="$s2"
+      now=""
+      local il; il=$(printf '%s' "$t" | grep -oE '\([0-9]+/[0-9]+\) (installing|upgrading|reinstalling|removing) [^ ]+' | tail -1)
+      if [ -n "$il" ]; then
+        local xn ph pk; xn=$(printf '%s' "$il" | grep -oE '[0-9]+/[0-9]+' | head -1)
+        ph=$(printf '%s' "$il" | awk '{print $2}'); pk=$(printf '%s' "$il" | awk '{print $3}')
+        now="$ph $pk ($xn)"
+        { [ "$t_dl0" -gt 0 ] && [ "$t_dl1" -eq 0 ]; } && t_dl1=$(date +%s)
+      else
+        { [ "$t_dl0" -eq 0 ] && printf '%s' "$t" | grep -qiE 'downloading|Retrieving'; } && t_dl0=$(date +%s)
+        local dp; dp=$(printf '%s' "$t" | grep -oE 'Total \([[:space:]]*[0-9]+/[0-9]+\)' | tail -1 | grep -oE '[0-9]+/[0-9]+')
+        [ -n "$dp" ] && now="downloading ($dp)"
+      fi
+      if [ -n "$now" ] && [ "$now" != "$last" ]; then printf '     %s\n' "$now"; last="$now"; fi
+      sleep 0.4
+    done
+    wait "$pid"; local rc=$?
+    if [ "$t_dl0" -gt 0 ]; then [ "$t_dl1" -eq 0 ] && t_dl1=$(date +%s); ARX_DLTIME=$((t_dl1-t_dl0)); ARX_SPEED=$(_speed "$ARX_DLSIZE" "$ARX_DLTIME"); fi
+    return $rc
+  fi
+  script -qefc "$cmdq" "$LOG" </dev/null >/dev/null 2>&1 & local pid=$!
+  printf '\033[?25l'
+  local i=0 N="" t_dl0=0 t_dl1=0
+  local ARX_COLS=${COLUMNS:-0}; [ "$ARX_COLS" -gt 0 ] 2>/dev/null || ARX_COLS=$(tput cols 2>/dev/null || echo 80)
+  while kill -0 "$pid" 2>/dev/null; do
+    local t; t=$(tail -c 6000 "$LOG" 2>/dev/null | sed 's/\x1b\[[0-9;?]*[a-zA-Z]//g; s/\r/\n/g')
+    [ -z "$N" ] && N=$(printf '%s' "$t" | grep -oE 'Packages \(([0-9]+)\)' | grep -oE '[0-9]+' | tail -1)
+    local s2; s2=$(printf '%s' "$t" | grep -oiE 'Total Download Size:[[:space:]]*[0-9.]+ [KMG]iB' | tail -1 | grep -oiE '[0-9.]+ [KMG]iB')
+    [ -n "$s2" ] && ARX_DLSIZE="$s2"
+    local pkg="" cur_sz="" spd="" pct="" xn="" phase="$label"
+    local il; il=$(printf '%s' "$t" | grep -oE '\([0-9]+/[0-9]+\) (installing|upgrading|reinstalling|removing) [^ ]+' | tail -1)
+    if [ -n "$il" ]; then
+      xn=$(printf '%s' "$il" | grep -oE '[0-9]+/[0-9]+' | head -1)
+      phase=$(printf '%s' "$il" | awk '{print $2}'); pkg=$(printf '%s' "$il" | awk '{print $3}')
+      [ -n "$xn" ] && pct=$(( ${xn%/*} * 100 / ${xn#*/} ))
+      { [ "$t_dl0" -gt 0 ] && [ "$t_dl1" -eq 0 ]; } && t_dl1=$(date +%s)
+    else
+      { [ "$t_dl0" -eq 0 ] && printf '%s' "$t" | grep -qiE 'downloading|Retrieving'; } && t_dl0=$(date +%s)
+      local dl; dl=$(printf '%s' "$t" | grep -oE '[A-Za-z0-9][A-Za-z0-9._+-]+[[:space:]]+[0-9.]+ [KMG]iB[[:space:]]+[0-9.]+ [KMG]iB/s[^%]*[0-9]+%' | tail -1)
+      if [ -n "$dl" ]; then
+        phase="downloading"; pkg=$(printf '%s' "$dl" | awk '{print $1}')
+        cur_sz=$(printf '%s' "$dl" | grep -oE '[0-9.]+ [KMG]iB' | head -1)
+        spd=$(printf '%s' "$dl" | grep -oE '[0-9.]+ [KMG]iB/s' | head -1)
+        pct=$(printf '%s' "$dl" | grep -oE '[0-9]+%' | tail -1 | tr -d '%')
+      elif printf '%s' "$t" | grep -q 'Running .*transaction hooks'; then phase="finalizing"
+      elif printf '%s' "$t" | grep -qiE 'checking (keys|package integrity)|loading package files'; then phase="verifying"
+      elif printf '%s' "$t" | grep -qiE 'resolving dependencies|looking for.*conflict'; then phase="resolving"
+      elif printf '%s' "$t" | grep -qiE 'Retrieving packages'; then phase="downloading"
+      elif printf '%s' "$t" | grep -qiE 'Synchronizing package databases'; then phase="synchronizing"
+      fi
+    fi
+    # Plymouth-style segmented bar as the loader (determinate fill when we know the
+    # percent, a sweeping window otherwise) + what is being worked on. The label is built
+    # as PLAIN text and capped to the terminal width so the line can never wrap - a wrapped
+    # line defeats the \r redraw and stacks the loader down the screen.
+    local tick=$((i++)) work="${phase}"; [ -n "$pkg" ] && work="${phase} ${pkg}"
+    [ -n "$pct" ] && work="${work} ${pct}%"
+    local meta=""
+    [ -n "$cur_sz" ] && meta+=" ${cur_sz}"
+    [ -n "$spd" ]    && meta+=" · ${spd}"
+    [ -n "$xn" ]     && meta+=" · ${xn}"
+    { [ -z "$xn" ] && [ -n "$N" ]; } && meta+=" · ${N} pkgs"
+    local text="${work}${meta}" avail=$(( ARX_COLS - 24 )); [ "$avail" -lt 8 ] && avail=8
+    [ "${#text}" -gt "$avail" ] && text="${text:0:avail}"
+    local bar; if [ -n "$pct" ]; then bar=$(_bar "$pct" 18); else bar=$(_bar -1 18 "$tick"); fi
+    printf "\r\033[K  %s  ${BD}%s${RS}" "$bar" "$text"
+    sleep 0.12
+  done
+  wait "$pid"; local rc=$?
+  if [ "$t_dl0" -gt 0 ]; then [ "$t_dl1" -eq 0 ] && t_dl1=$(date +%s); ARX_DLTIME=$((t_dl1-t_dl0)); ARX_SPEED=$(_speed "$ARX_DLSIZE" "$ARX_DLTIME"); fi
+  printf '\r\033[K\033[?25h'
+  return $rc
+}
+
+# Turn raw pacman/yay log noise into one clean error line.
+_diagnose(){
+  if   grep -qiE 'error downloading sources|==> ERROR: Failure while downloading' "$LOG"; then
+        echo "an AUR package source could not be downloaded (upstream moved or removed it) - the PKGBUILD needs an upstream fix, not a system repair: $(grep -ioE 'error making: [^ ]+' "$LOG" | sed 's/.*: //' | tr '\n' ' ')"
+  elif grep -qiE 'Resolving timed out|Could not resolve host|name resolution|No address record|failed retrieving file' "$LOG"; then
+        echo "network unreachable - could not reach the mirrors (check DNS / connection)"
+  elif grep -qi 'failed to synchronize all databases' "$LOG"; then
+        echo "could not synchronize the repositories"
+  elif grep -qiE 'target not found' "$LOG"; then
+        echo "not found: $(grep -ioE 'target not found: [^ ]+' "$LOG" | sed 's/.*: //' | tr '\n' ' ')"
+  elif grep -qiE 'exists in filesystem|conflicting files' "$LOG"; then
+        echo "file conflict: $(grep -iE 'exists in filesystem' "$LOG" | head -1 | sed -E 's/.*: //;s/ exists.*//')"
+  elif grep -qiE 'are in conflict|unresolvable package conflicts'  "$LOG"; then
+        echo "package conflict: $(grep -iE 'are in conflict' "$LOG" | head -1 | sed 's/^[: ]*//')"
+  elif grep -qiE 'invalid or corrupted package|signature .*unknown|key .* could not be looked up|unknown trust' "$LOG"; then
+        echo "keyring/signature problem - refresh the keyring and retry"
+  elif grep -qiE 'could not satisfy dependencies|unable to satisfy dependency'      "$LOG"; then
+        echo "unsatisfied dependencies"
+  elif grep -qiE 'not enough free disk space'  "$LOG"; then
+        echo "not enough disk space"
+  elif grep -qiE 'could not lock database|unable to lock'  "$LOG"; then
+        echo "database is locked (another package operation is running)"
+  elif grep -qiE 'unsafe path transition|Detected unsafe path' "$LOG"; then
+        echo "a system directory had non-root ownership (now auto-repaired) - re-run to finish"
+  else
+        local e; e=$(grep -iE '^error:' "$LOG" | head -1 | sed 's/^error: //I')
+        echo "${e:-operation failed}"
+  fi
+}
+
+# Classify the failure in $LOG into a known error class (Arch Wiki: Pacman/Troubleshooting).
+_errkey(){
+  if   grep -qiE 'error downloading sources|==> ERROR: Failure while downloading' "$LOG"; then echo srcfail
+  elif grep -qiE 'could not open file [^:]*local/[^:]+/(desc|files|mtree): No such file|database is inconsistent' "$LOG"; then echo dbcorrupt
+  elif grep -qiE 'exists in filesystem|conflicting files'                                   "$LOG"; then echo fileconflict
+  elif grep -qiE 'signature .*(unknown|marginal|never|invalid|expired|not valid)|unknown trust|not trusted|could not be looked up|required key missing from keyring|keyserver receive failed|no valid OpenPGP data|keyring is not writable|GPGME|invalid or corrupted package \(PGP' "$LOG"; then echo keyring
+  elif grep -qiE 'could not lock database|unable to lock'                                   "$LOG"; then echo lock
+  elif grep -qiE 'certificate has expired|certificate is not yet valid|SSL certificate|certificate verify failed|SSL_ERROR|TLS connect|gnutls_handshake|unable to get local issuer|failed retrieving file .* from [^ ]+ :' "$LOG"; then echo mirror
+  elif grep -qiE 'failed to synchronize all databases|failed retrieving file.*\.db|error.*404|failed to update' "$LOG"; then echo db
+  elif grep -qiE 'invalid or corrupted package|wrong or NULL|unexpected end of file'         "$LOG"; then echo corrupt
+  elif grep -qiE 'not enough free disk space'                                                "$LOG"; then echo diskspace
+  elif grep -qiE 'could not resolve host|Resolving timed out|name resolution|Network is unreachable|Could not connect|Connection timed out' "$LOG"; then echo network
+  elif grep -qiE 'could not satisfy dependencies|unable to satisfy dependency'               "$LOG"; then echo deps
+  elif grep -qiE 'unknown public key [0-9A-Fa-f]{8,}|FAILED \(unknown public key'             "$LOG"; then echo aurkey
+  elif grep -qiE 'error making:|A failure occurred in (build|package|prepare)|could not find all required packages|ERROR: (Could not|One or more)' "$LOG"; then echo aurbuild
+  else echo unknown; fi
+}
+
+# Self-heal: apply the known fix for the detected error. Returns 0 if a fix was
+# applied (the caller should retry the operation), 1 if there is no auto-fix.
+_heal(){
+  local k kr pop pkgs; k=$(_errkey)
+  case "$k" in
+    keyring)
+      kr=$(_keyrings); pop="${kr%|*}"; pkgs="${kr#*|}"
+      if [ "${_HEAL_N:-1}" -ge 2 ]; then
+        _dim "self-heal · rebuilding keyring from scratch"
+        # Release any gpg process holding the keyring dir, otherwise the rm fails
+        # "Device or resource busy" and leaks the raw error into the loader.
+        sudo gpgconf --kill all >>"$LOG" 2>&1 || true
+        local _g; for _g in gpg-agent dirmngr keyboxd scdaemon; do sudo pkill -9 -x "$_g" 2>>"$LOG"; done
+        sudo fuser -k /etc/pacman.d/gnupg >>"$LOG" 2>&1 || true
+        sudo rm -rf /etc/pacman.d/gnupg >>"$LOG" 2>&1
+        sudo pacman-key --init          >>"$LOG" 2>&1
+        sudo pacman-key --populate $pop  >>"$LOG" 2>&1
+      else
+        _dim "self-heal · updating keyrings + rebuilding trust db"
+        # Canonical fix first: refresh the keyring PACKAGES (repairs "required key
+        # missing" + expired keys), then re-populate and rebuild the trust db.
+        sudo pacman -Sy --noconfirm $pkgs >>"$LOG" 2>&1
+        sudo pacman-key --init           >>"$LOG" 2>&1
+        sudo pacman-key --populate $pop   >>"$LOG" 2>&1
+        sudo pacman-key --updatedb        >>"$LOG" 2>&1
+        # Expired signing keys: pull fresh copies from a keyserver (bounded).
+        grep -qiE 'expired|marginal trust' "$LOG" && timeout 60 sudo pacman-key --refresh-keys >>"$LOG" 2>&1 || true
+      fi
+      sudo pacman -Sy --noconfirm $pkgs >>"$LOG" 2>&1; return 0 ;;
+    lock)
+      pgrep -x pacman >/dev/null 2>&1 && return 1
+      _dim "self-heal · clearing stale database lock"; sudo rm -f /var/lib/pacman/db.lck; return 0 ;;
+    db|network|mirror)
+      if [ "${_HEAL_N:-1}" -ge 2 ]; then _dim "self-heal · rebuilding sync databases"; sudo rm -f /var/lib/pacman/sync/*.db 2>/dev/null
+      else _dim "self-heal · re-ranking mirrors (fresh · https) + refreshing databases"; fi
+      if command -v reflector >/dev/null 2>&1; then
+        sudo cp -f /etc/pacman.d/mirrorlist /etc/pacman.d/mirrorlist.arx-bak 2>/dev/null
+        sudo bash -c 'reflector --age 12 --latest 20 --sort rate --protocol https --save /etc/pacman.d/mirrorlist 2>/dev/null; [ "$(grep -c ^Server /etc/pacman.d/mirrorlist)" -ge 5 ] || reflector --latest 20 --sort rate --protocol https,http --save /etc/pacman.d/mirrorlist 2>/dev/null' >>"$LOG" 2>&1
+      fi
+      sudo pacman -Syy >>"$LOG" 2>&1; return 0 ;;
+    corrupt)
+      _dim "self-heal · clearing corrupted downloads"
+      sudo find /var/cache/pacman/pkg -name '*.part' -delete 2>/dev/null
+      sudo pacman -Scc --noconfirm >>"$LOG" 2>&1; return 0 ;;
+    diskspace)
+      _dim "self-heal · freeing disk space"
+      command -v paccache >/dev/null 2>&1 && sudo paccache -rk1 >>"$LOG" 2>&1
+      sudo pacman -Sc --noconfirm >>"$LOG" 2>&1; return 0 ;;
+    deps)
+      _dim "self-heal · full system sync to resolve dependencies"
+      sudo pacman -Syu --noconfirm >>"$LOG" 2>&1; return 0 ;;
+    dbcorrupt)
+      _dim "self-heal · repairing corrupted local database entries"
+      local d; for d in $(grep -oE '/var/lib/pacman/local/[A-Za-z0-9._+-]+' "$LOG" | sort -u); do
+        { [ -d "$d" ] && [ ! -f "$d/desc" ]; } && sudo rm -rf "$d"
+      done
+      return 0 ;;
+    aurkey)
+      _dim "self-heal · importing missing AUR signing keys"
+      local k; for k in $(grep -oiE 'unknown public key [0-9A-Fa-f]{8,}' "$LOG" | grep -oiE '[0-9A-Fa-f]{8,}' | sort -u); do
+        gpg --recv-keys "$k" >>"$LOG" 2>&1 || gpg --keyserver hkps://keyserver.ubuntu.com --recv-keys "$k" >>"$LOG" 2>&1
+      done
+      return 0 ;;
+    aurbuild)
+      _dim "self-heal · refreshing deps + clearing AUR build cache"
+      sudo pacman -Syu --noconfirm >>"$LOG" 2>&1
+      command -v yay >/dev/null 2>&1 && yay -Sc --noconfirm >>"$LOG" 2>&1
+      return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# Run a pacman operation with up to two self-heal + retry cycles.
+_run(){ # label cmd...
+  local label="$1"; shift
+  _HEAL_N=0; ARX_HEALED=0; local extra=() tries=0 f files
+  _fix_sysdirs   # heal any non-root system-dir ownership before it can fail the tx hooks
+  _load "$label" "$@"; local rc=$?
+  while [ $rc -ne 0 ] && [ $tries -lt 2 ]; do
+    if [ "$(_errkey)" = fileconflict ]; then
+      files=$(grep -oiE '[^ ]+ exists in filesystem' "$LOG" | sed 's/ exists.*//' | sort -u)
+      [ -z "$files" ] && break
+      local nf d f; nf=$(printf '%s\n' "$files" | grep -c .); extra=()
+      if [ "$nf" -gt 80 ]; then
+        # massive conflict (usually stray files from a prior manual/git install) —
+        # overwrite by common parent path, not one --overwrite per file (a 10k-arg
+        # argv breaks the retry; this still scopes the override to the clash dirs).
+        for d in $(printf '%s\n' "$files" | sed -E 's#(/[^/]+/[^/]+)/.*#\1#' | sort -u); do extra+=(--overwrite "$d/*"); done
+        _dim "self-heal · overwriting $nf stray file(s)"
+      else
+        for f in $files; do extra+=(--overwrite "$f"); done
+        _dim "self-heal · overwriting $nf conflicting file(s)"
+      fi
+    else
+      _HEAL_N=$((_HEAL_N+1)); _heal || break
+    fi
+    tries=$((tries+1))
+    _load "retry $tries · $label" "$@" "${extra[@]}"; rc=$?
+  done
+  ARX_HEALED=$tries
+  return $rc
+}
+
+# AUR malware safety: fetch each PKGBUILD and flag high-risk patterns before building.
+_aur_safety(){ # pkg...
+  command -v curl >/dev/null 2>&1 || return 0
+  local pkg pb hits meta risk flagged=0
+  for pkg in "$@"; do
+    [[ "$pkg" == -* ]] && continue
+    pb=$(curl -fsSL --max-time 12 "https://aur.archlinux.org/cgit/aur.git/plain/PKGBUILD?h=$pkg" 2>/dev/null)
+    hits=$(printf '%s\n' "$pb" | grep -niE \
+      'curl[^|]*\|[[:space:]]*(ba)?sh|wget[^|]*\|[[:space:]]*(ba)?sh|base64[[:space:]]+-d.*\|[[:space:]]*(ba)?sh|\|[[:space:]]*(node|python[0-9]?|perl|ruby)[[:space:]]|/dev/tcp/|[^a-z](nc|ncat)[[:space:]][^|]*-e[[:space:]]|[^a-z]sudo[[:space:]]|systemctl[[:space:]]+enable|/etc/cron|[^a-z]useradd[[:space:]]|chmod[[:space:]]+777|>[[:space:]]*/etc/|npm[[:space:]][^|]*--unsafe-perm|npx[[:space:]]+[^[:space:]]*https?://|pip[0-9]?[[:space:]]+install[[:space:]]+[^[:space:]]*https?://' 2>/dev/null)
+    if [ -n "$hits" ]; then
+      _no "AUR safety flagged '$pkg' (PKGBUILD):"
+      printf '%s\n' "$hits" | head -5 | sed -E 's/^/      /'
+      flagged=$((flagged+1))
+    fi
+    # reputation: out-of-date / orphaned / brand-new (hijack-prone) via the AUR RPC
+    if command -v python3 >/dev/null 2>&1; then
+      meta=$(curl -fsSL -g --max-time 10 "https://aur.archlinux.org/rpc/v5/info?arg[]=$pkg" 2>/dev/null)
+      risk=$(printf '%s' "$meta" | python3 -c 'import sys,json,time
+try:
+ d=json.load(sys.stdin).get("results") or []
+ r=d[0] if d else {}; o=[]
+ if r.get("OutOfDate"): o.append("flagged out-of-date")
+ if d and not r.get("Maintainer"): o.append("orphaned (no maintainer)")
+ v=r.get("NumVotes",0); a=(time.time()-r.get("FirstSubmitted",0))/86400 if r.get("FirstSubmitted") else 999
+ if d and v<3 and a<30: o.append("brand-new + unvetted ("+str(v)+" votes)")
+ print(" . ".join(o))
+except: pass' 2>/dev/null)
+      if [ -n "$risk" ]; then _no "AUR reputation '$pkg': $risk"; flagged=$((flagged+1)); fi
+    fi
+  done
+  if [ "$flagged" -gt 0 ]; then
+    printf "\n  ${RD}!! these patterns can indicate malware — review the PKGBUILD before building.${RS}\n\n"
+    [ -n "$ASSUME_YES" ] && { _no "refusing to auto-build a flagged AUR package (review it, then run without -y)"; return 1; }
+    printf "  ${BD}build anyway?${RS} ${DM}[y/N]${RS} "; local a; read -r a; [[ "$a" =~ ^[Yy]$ ]] || { _dim "cancelled"; printf "\n"; return 1; }
+  fi
+  return 0
+}
+
+# Run a command silently with a phase-aware spinner derived from its log.
+# During the download phase it surfaces the total size + elapsed time, and
+# records size/time/speed into ARX_DLSIZE / ARX_DLTIME / ARX_SPEED for the summary.
+_quiet(){ # default_label cmd...
+  local label="$1"; shift
+  ARX_DLSIZE=""; ARX_DLTIME=0; ARX_SPEED=""
+  if [ ! -t 1 ]; then
+    # No TTY (GUI/pipe): no spinner frames — run quietly, emit one clean line per
+    # phase change (this is the "checking for updates" path that used to spam).
+    ( "$@" >"$LOG" 2>&1 ) & local qpid=$! qlast="" qph qt0=0 qsz
+    printf '  >> %s\n' "$label"
+    while kill -0 "$qpid" 2>/dev/null; do
+      qph=""
+      if   grep -q 'Running .*transaction hooks' "$LOG" 2>/dev/null; then qph="finalizing"
+      elif grep -qE '\([0-9]+/[0-9]+\) (installing|upgrading|reinstalling|removing)' "$LOG" 2>/dev/null; then
+           qph="applying $(grep -oE '\([0-9]+/[0-9]+\) (installing|upgrading|reinstalling|removing)' "$LOG" | tail -1 | grep -oE '[0-9]+/[0-9]+')"
+      elif grep -qiE 'checking (keys|package integrity)|loading package files' "$LOG" 2>/dev/null; then qph="verifying"
+      elif grep -qiE 'Retrieving packages|downloading' "$LOG" 2>/dev/null; then
+           [ "$qt0" -eq 0 ] && qt0=$(date +%s)
+           qsz=$(grep -oiE 'Total Download Size:[[:space:]]*[0-9.]+ [KMG]iB' "$LOG" | tail -1 | grep -oiE '[0-9.]+ [KMG]iB'); [ -n "$qsz" ] && ARX_DLSIZE="$qsz"
+           qph="downloading${ARX_DLSIZE:+ · $ARX_DLSIZE}"
+      elif grep -qiE 'system upgrade|resolving dependencies|looking for conflicting' "$LOG" 2>/dev/null; then qph="resolving"
+      elif grep -qiE 'Synchronizing package databases' "$LOG" 2>/dev/null; then qph="synchronizing"
+      fi
+      if [ -n "$qph" ] && [ "$qph" != "$qlast" ]; then printf '     %s\n' "$qph"; qlast="$qph"; fi
+      sleep 0.4
+    done
+    wait "$qpid"; local qrc=$?
+    [ "$qt0" -gt 0 ] && { ARX_DLTIME=$(( $(date +%s) - qt0 )); ARX_SPEED=$(_speed "$ARX_DLSIZE" "$ARX_DLTIME"); }
+    return $qrc
+  fi
+  ( "$@" >"$LOG" 2>&1 ) & local pid=$! i=0 ph sz t_dl0=0 t_dl1=0
+  printf '\033[?25l'
+  while kill -0 "$pid" 2>/dev/null; do
+    ph="$label"
+    if   grep -q 'Running .*transaction hooks' "$LOG" 2>/dev/null; then ph="finalizing"; { [ "$t_dl0" -gt 0 ] && [ "$t_dl1" -eq 0 ]; } && t_dl1=$(date +%s)
+    elif grep -qE '\([0-9]+/[0-9]+\) (installing|upgrading|reinstalling|removing)' "$LOG" 2>/dev/null; then
+         ph="applying $(grep -oE '\([0-9]+/[0-9]+\) (installing|upgrading|reinstalling|removing)' "$LOG" | tail -1 | grep -oE '[0-9]+/[0-9]+')"
+         { [ "$t_dl0" -gt 0 ] && [ "$t_dl1" -eq 0 ]; } && t_dl1=$(date +%s)
+    elif grep -qiE 'checking (keys|package integrity)|loading package files' "$LOG" 2>/dev/null; then ph="verifying"; { [ "$t_dl0" -gt 0 ] && [ "$t_dl1" -eq 0 ]; } && t_dl1=$(date +%s)
+    elif grep -qiE 'Retrieving packages|downloading'   "$LOG" 2>/dev/null; then
+         [ "$t_dl0" -eq 0 ] && t_dl0=$(date +%s)
+         sz=$(grep -oiE 'Total Download Size:[[:space:]]*[0-9.]+ [KMG]iB' "$LOG" | tail -1 | grep -oiE '[0-9.]+ [KMG]iB')
+         [ -n "$sz" ] && ARX_DLSIZE="$sz"
+         ph="downloading${ARX_DLSIZE:+ · $ARX_DLSIZE} · $(( $(date +%s) - t_dl0 ))s"
+    elif grep -qiE 'system upgrade|resolving dependencies|looking for conflicting' "$LOG" 2>/dev/null; then ph="resolving"
+    elif grep -qiE 'Synchronizing package databases'   "$LOG" 2>/dev/null; then ph="synchronizing"
+    fi
+    printf "\r  ${C}%s${RS}  ${DM}%s${RS}\033[K" "${SPIN[i++ % ${#SPIN[@]}]}" "$ph"
+    sleep 0.1
+  done
+  wait "$pid"; local rc=$?
+  if [ "$t_dl0" -gt 0 ]; then
+    [ "$t_dl1" -eq 0 ] && t_dl1=$(date +%s); ARX_DLTIME=$((t_dl1 - t_dl0))
+    ARX_SPEED=$(_speed "$ARX_DLSIZE" "$ARX_DLTIME")
+  fi
+  printf '\r\033[K\033[?25h'
+  return $rc
+}
+
+_confirm(){ # prompt-noun
+  [ -n "$ASSUME_YES" ] && return 0
+  [ ! -t 0 ] && return 0   # non-interactive (ARXOS Control Center GUI / piped): proceed
+  printf "  ${BD}proceed?${RS} ${DM}[y/N]${RS} "
+  local a; read -r a; [[ "$a" =~ ^[Yy]$ ]] && return 0
+  _dim "cancelled"; printf "\n"; return 1
+}
+
+# keep the sudo credential fresh during long ops so no re-prompt mid-run
+_keepalive(){ [ -n "$_ARX_KA" ] && return 0; ( while sudo -n -v 2>/dev/null; do sleep 30; done ) & _ARX_KA=$!; }
+_auth(){
+  [ "$(id -u)" -eq 0 ] && return 0                           # already root -> no sudo needed at all
+  sudo -n true 2>/dev/null && return 0                       # passwordless (NOPASSWD)
+  if [ -t 0 ] || [ -t 1 ]; then                              # a terminal -> normal in-terminal prompt
+    sudo -v 2>/dev/null && { _keepalive; return 0; }
+  elif [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]; then       # real GUI session (no tty) -> ArxOS password dialog
+    local ap=/usr/local/bin/arxos-askpass
+    [ -x "$ap" ] || ap="$(command -v arxos-askpass 2>/dev/null)"
+    if [ -n "$ap" ] && SUDO_ASKPASS="$ap" sudo -A -v 2>/dev/null; then
+      export SUDO_ASKPASS="$ap"; _keepalive; return 0
+    fi
+  fi
+  # No tty AND no GUI session (a background/systemd/headless context): never spawn an
+  # un-answerable askpass dialog on someone's desktop - fail cleanly so the caller logs + moves on.
+  _no "sudo authentication required"; exit 1
+}
+
+# Self-heal: if a critical system directory NODE ends up owned by a non-root user
+# (e.g. /usr or /usr/local getting chowned to the build/ssh user), systemd-tmpfiles
+# refuses the "unsafe path transition" and fails EVERY package transaction's hooks
+# ("error: command failed to execute correctly"). Cheap to check (a few stats); only
+# touches anything when it is actually broken, and only the dir node (never recursive).
+_fix_sysdirs(){
+  local d bad=()
+  for d in /usr /usr/local /usr/local/bin /usr/local/sbin /usr/local/share /usr/local/lib \
+           /usr/share /usr/lib /usr/bin /etc /var /opt /srv; do
+    [ -d "$d" ] || continue
+    [ "$(stat -c %u "$d" 2>/dev/null)" = 0 ] || bad+=("$d")
+  done
+  [ ${#bad[@]} -eq 0 ] && return 0
+  _auth
+  _dim "self-heal · restoring root ownership on ${#bad[@]} system dir(s): ${bad[*]}"
+  sudo chown root:root "${bad[@]}" 2>/dev/null
+}
+
+_ensure_yay(){
+  command -v yay >/dev/null 2>&1 && return 0
+  _title "AUR helper"
+  _dim "yay is not installed - bootstrapping it so AUR installs can continue"
+  _auth
+  _quiet "installing build dependencies" sudo pacman -S --needed --noconfirm base-devel git
+  if [ $? -ne 0 ]; then _no "$(_diagnose)"; return 1; fi
+  local build="${XDG_CACHE_HOME:-$HOME/.cache}/arxos/aur/yay"
+  mkdir -p "$(dirname "$build")"
+  if [ -d "$build/.git" ]; then
+    _load "syncing yay PKGBUILD" git -C "$build" pull --ff-only
+  else
+    _load "fetching yay PKGBUILD" git clone --depth=1 https://aur.archlinux.org/yay.git "$build"
+  fi
+  if [ $? -ne 0 ]; then _no "could not fetch yay from the AUR"; return 1; fi
+  _load "building yay" bash -lc "cd '$build' && makepkg -si --noconfirm"
+  local rc=$?
+  [ $rc -eq 0 ] && _ok "yay installed" || _no "$(_diagnose)"
+  return $rc
+}
+
+op_pip(){
+  local py=python3
+  if [ "${1:-}" = "--python" ]; then py="${2:-python3}"; shift 2; fi
+  if [ "${1:-}" = "install" ]; then
+    shift
+    [ $# -eq 0 ] && { _title "pip"; _no "no package specified"; return 1; }
+    _title "pip install" "$*"
+    _confirm || return 0
+    _load "installing Python package(s)" "$py" -m pip install --break-system-packages "$@"
+    local rc=$?
+    [ $rc -eq 0 ] && _ok "Python package(s) installed" || _no "$(_diagnose)"
+    return $rc
+  fi
+  command "$py" -m pip "$@"
+}
+
+# ---------------- operations ----------------
+# Reapply ARXOS hardening that a package update can clobber (e.g. Firefox replaces its whole lib
+# dir on upgrade, wiping the autoconfig). Each /usr/lib/arxos/reapply-*.sh restores one thing.
+# The libalpm hooks fire on the specific package too; arx owns this as well so hardening holds
+# even if a hook is ever missing, and covers ARXOS tools that ship no hook of their own.
+_reharden(){
+  local s ran=0
+  for s in /usr/lib/arxos/reapply-*.sh; do
+    [ -x "$s" ] || continue
+    sudo "$s" >>"$LOG" 2>&1 && ran=$((ran+1))
+  done
+  [ "${ran:-0}" -gt 0 ] && _dim "reapplied $ran ARXOS hardening set(s)"
+  return 0
+}
+
+op_update(){
+  _title "system upgrade"
+  _auth
+  local list n=0
+  if command -v checkupdates >/dev/null 2>&1; then
+    _quiet "checking for updates" checkupdates
+    if grep -qiE 'Resolving timed out|could not resolve|failed retrieving|name resolution' "$LOG"; then _no "$(_diagnose)"; return 1; fi
+    list=$(grep -E '^[a-zA-Z0-9]' "$LOG"); n=$(printf '%s' "$list" | grep -c . 2>/dev/null)
+    if [ "${n:-0}" -eq 0 ]; then
+      # System repos are current, but AUR-only updates must NOT be skipped —
+      # otherwise they sit forever and the update counter never clears.
+      if command -v yay >/dev/null 2>&1; then
+        local aur an; aur=$(yay -Qua 2>/dev/null); an=$(printf '%s' "$aur" | grep -c . 2>/dev/null)
+        if [ "${an:-0}" -gt 0 ]; then
+          _dim "system current · $an AUR update(s)"
+          printf '%s\n' "$aur" | head -8 | awk -v D="$DM" -v R="$RS" '{printf "    %s+%s %s\n", D, R, $1}'
+          printf "\n"; _confirm || return 0
+          _run "upgrading AUR" yay -Sua --noconfirm; local rc=$?
+          [ $rc -eq 0 ] && _summary "AUR upgraded" "$an" || _no "$(_diagnose)"
+          return $rc
+        fi
+      fi
+      _ok "system is up to date"; return 0
+    fi
+    _dim "$n package(s) to upgrade"
+    _pkgcols "$list"
+    printf "\n"
+  fi
+  _confirm || return 0
+  _run "upgrading" sudo pacman -Syu --noconfirm
+  local rc=$?
+  if [ $rc -eq 0 ]; then
+    [ "${n:-0}" -eq 0 ] && n=$(grep -cE '^\([0-9]+/[0-9]+\) upgrading' "$LOG" 2>/dev/null)
+    command -v yay >/dev/null 2>&1 && _run "upgrading AUR" yay -Sua --noconfirm
+    _reharden
+    _summary "system upgraded" "${n:-0}"
+  else _no "$(_diagnose)"; fi
+  return $rc
+}
+
+# Sync ARXOS's own tool repos (the former standalone `arxupd`) — folded in so a
+# single `arx update` upgrades BOTH the system and ARXOS's tools (one unified
+# updater / self-update). Uses arx's clean loader, so no-TTY output stays tidy.
+# Supply-chain verification for a synced tool repo BEFORE running its install.sh.
+# Manifest verify token (5th column):
+#   commit=<sha>  HEAD must equal this exact commit (reproducible pin)
+#   tag=<name>    a GPG-signed annotated tag that points at HEAD
+#   signed        HEAD commit must carry a valid GPG signature from a trusted key
+# Returns 0 = verified, 1 = failed (caller then skips install.sh, fail-closed).
+_verify_repo(){
+  local dir="$1" v="$2" head tc t
+  head=$(git -C "$dir" rev-parse HEAD 2>/dev/null)
+  case "$v" in
+    commit=*)
+      [ -n "$head" ] && [ "$head" = "${v#commit=}" ] && return 0
+      _dim "verify: HEAD ${head:0:8} != pinned ${v#commit=}"; return 1 ;;
+    tag=*)
+      t="${v#tag=}"
+      git -C "$dir" fetch -q --tags origin >/dev/null 2>&1
+      git -C "$dir" tag -v "$t" >/dev/null 2>&1 || { _dim "verify: tag $t signature invalid/missing"; return 1; }
+      tc=$(git -C "$dir" rev-parse "refs/tags/$t^{commit}" 2>/dev/null)
+      [ -n "$tc" ] && [ "$tc" = "$head" ] && return 0
+      _dim "verify: tag $t does not point at the checked-out commit"; return 1 ;;
+    signed|sig)
+      git -C "$dir" verify-commit HEAD >/dev/null 2>&1 && return 0
+      _dim "verify: HEAD commit is not signed by a trusted key"; return 1 ;;
+    ""|-) return 0 ;;
+    *) _dim "verify: unknown token '$v' — refusing (fail-closed)"; return 1 ;;
+  esac
+}
+
+op_tools(){
+  _title "ARXOS tools"
+  # Cache the sudo credential ONCE, up front, in this main flow (which owns the tty
+  # when launched from a terminal -> in-terminal `sudo -v`, no askpass dialog). The
+  # manifest refresh below and every tool install.sh run backgrounded with no tty,
+  # so without this each of their `sudo` calls would fall through to a fresh askpass
+  # popup (once per tool). Pre-authing here keeps them all silent. In the unified
+  # `arx update` path op_update already authed, so this returns immediately.
+  _auth || true
+  local manifest="${ARXOS_MANIFEST:-/etc/arxos/repos.list}"
+  local manifest_url="${ARXOS_MANIFEST_URL:-https://raw.githubusercontent.com/thearxos/arxupd/main/repos.list}"
+  local cache="${XDG_CACHE_HOME:-$HOME/.cache}/arxos/repos"; mkdir -p "$cache"
+  # Self-updating registry: fetch the canonical manifest first, so any ARXOS repo
+  # added upstream (a new tool, the kernel, a core component) reaches every install
+  # on the next `arx update`. Each line is the "alias" the updater + Control Center read.
+  if command -v curl >/dev/null 2>&1; then
+    local tmp="$cache/.repos.list.new"
+    if curl -fsSL --max-time 12 "$manifest_url" -o "$tmp" 2>/dev/null && grep -qE '^[a-z0-9]' "$tmp"; then
+      if ! cmp -s "$tmp" "$manifest" 2>/dev/null; then
+        sudo cp -f "$tmp" "$manifest" 2>/dev/null && _dim "registry refreshed · $(grep -cE '^[a-z0-9]' "$tmp") component(s)"
+      fi
+    fi
+  fi
+  if [ ! -f "$manifest" ]; then _dim "no tool manifest ($manifest) — nothing to sync"; printf "\n"; return 0; fi
+  local up=0 new=0 same=0 err=0 name url branch type verify dir before after fresh
+  while read -r name url branch type verify _; do
+    [[ -z "$name" || "$name" == \#* ]] && continue
+    branch="${branch:-main}"; type="${type:-tool}"; verify="${verify:-}"; dir="$cache/$name"; fresh=0
+    # supply chain: only pull over HTTPS (blocks http/ssh/file manifest tampering)
+    case "$url" in https://*) : ;; *) printf "  ${RD}xx${RS} %-22s ${RD}refused: non-HTTPS url${RS}\n" "$name"; err=$((err+1)); continue ;; esac
+    if [ -d "$dir/.git" ]; then
+      git -C "$dir" remote set-url origin "$url" 2>/dev/null   # follow manifest URL changes (e.g. -> public -dist mirror)
+      before=$(git -C "$dir" rev-parse HEAD 2>/dev/null)
+      if [ -n "$verify" ]; then   # verify needs full history + tags, not a shallow fetch
+        _load "$name · syncing" bash -c "git -C '$dir' fetch -q origin '$branch' && git -C '$dir' fetch -q --tags origin && git -C '$dir' reset -q --hard 'origin/$branch'" || { printf "  ${RD}xx${RS} %-22s ${RD}sync failed${RS}\n" "$name"; err=$((err+1)); continue; }
+      else
+        _load "$name · syncing" bash -c "git -C '$dir' fetch -q --depth=1 origin '$branch' && git -C '$dir' reset -q --hard 'origin/$branch'" || { printf "  ${RD}xx${RS} %-22s ${RD}sync failed${RS}\n" "$name"; err=$((err+1)); continue; }
+      fi
+      after=$(git -C "$dir" rev-parse HEAD 2>/dev/null)
+      if [ "$before" = "$after" ]; then printf "  ${DM}..${RS} %-22s ${DM}up to date${RS}\n" "$name"; same=$((same+1)); continue; fi
+    else
+      if [ -n "$verify" ]; then
+        _load "$name · cloning" git clone -q -b "$branch" "$url" "$dir" || { printf "  ${RD}xx${RS} %-22s ${RD}clone failed${RS}\n" "$name"; err=$((err+1)); continue; }
+      else
+        _load "$name · cloning" git clone -q --depth=1 -b "$branch" "$url" "$dir" || { printf "  ${RD}xx${RS} %-22s ${RD}clone failed${RS}\n" "$name"; err=$((err+1)); continue; }
+      fi
+      fresh=1
+    fi
+    # verify BEFORE running install.sh (fail-closed: a tampered/unsigned update never executes)
+    if [ -n "$verify" ]; then
+      if ! _verify_repo "$dir" "$verify"; then
+        printf "  ${RD}xx${RS} %-22s ${RD}verification failed - install skipped${RS}\n" "$name"; err=$((err+1)); continue; fi
+      _dim "$name · verified ($verify)"
+    fi
+    if [ -f "$dir/install.sh" ]; then
+      if ! _load "$name · installing" bash -c "cd '$dir' && bash install.sh"; then
+        printf "  ${RD}xx${RS} %-22s ${RD}install failed${RS}\n" "$name"; err=$((err+1)); continue; fi
+    fi
+    local tag=""; [ "$type" != tool ] && tag=" ${DM}($type)${RS}"
+    if [ "$fresh" = 1 ]; then printf "  ${GR}>>${RS} %-22s ${GR}installed${RS}%s\n" "$name" "$tag"; new=$((new+1))
+    else printf "  ${GR}>>${RS} %-22s ${GR}updated${RS}%s\n" "$name" "$tag"; up=$((up+1)); fi
+  done < "$manifest"
+  printf "\n     ${DM}%s updated · %s installed · %s current · %s failed${RS}\n\n" "$up" "$new" "$same" "$err"
+  [ "$err" -eq 0 ]
+}
+
+# Unified updater: system packages + ARXOS tools, one command, one flow.
+op_upgrade_all(){
+  op_update "$@"; local r1=$?
+  op_tools;       local r2=$?
+  return $(( r1 != 0 || r2 != 0 ))
+}
+
+# ---------------- ARXOS Weapons arsenal (taxonomy-driven) ----------------
+# Reads the ARXOS tool taxonomy (name|MENU|SUB|cat|desc) and turns it into a
+# browsable arsenal: 4 menus (Offensive/Bug Bounty/Defensive/Research) → groups
+# → tools, and one-command install of a whole group.
+ARXOS_TOOLS="${ARXOS_TOOLS:-/usr/share/arxos/tools.db}"
+_wname(){ case "$1" in O) echo "Offensive";; B) echo "Bug Bounty";; D) echo "Defensive";; R) echo "Research";; *) echo "$1";; esac; }
+_wcode(){ case "${1,,}" in o|off|offense|offensive) echo O;; b|bb|bug|bugbounty|bug-bounty) echo B;; d|def|defense|defensive|blue) echo D;; r|res|research) echo R;; *) echo "";; esac; }
+_wrows(){ grep -E '^[A-Za-z0-9._+-]+\|[OBDR]\|[A-Za-z0-9]+\|' "$ARXOS_TOOLS" 2>/dev/null; }   # data rows only
+_WC=$'\033[38;5;45m'; _WD=$'\033[90m'; _WR=$'\033[0m'
+
+op_weapons(){
+  [ -f "$ARXOS_TOOLS" ] || { _no "arsenal taxonomy not found at ${ARXOS_TOOLS}"; _dim "ship it: sudo install -Dm644 ArxOS-tools-categorization.md ${ARXOS_TOOLS}"; return 1; }
+  [ -n "$(_wrows | head -1)" ] || { _no "arsenal taxonomy has no tool rows yet (still being populated)"; return 1; }
+  local cmd="${1:-}"; [ $# -gt 0 ] && shift
+  case "$cmd" in
+    ""|ls|list|menu|menus)
+      _title "weapons arsenal"
+      local m n
+      for m in O B D R; do
+        n=$(_wrows | awk -F'|' -v M="$m" '$2==M' | wc -l | tr -d ' ')
+        printf "  ${GB}%s${RS} ${DM}· %s tools${RS}\n" "$(_wname "$m")" "$n"
+        _wrows | awk -F'|' -v M="$m" '$2==M{print $3}' | sort | uniq -c | sort -rn \
+          | awk -v C="$_WC" -v R="$_WR" -v D="$_WD" '{printf "     %s%-10s%s %s(%s)%s\n", C, tolower($2), R, D, $1, R}'
+        printf "\n"
+      done
+      _dim "a group:  arx weapons <group>    ·    install:  arx weapons install <group>" ;;
+    search|find|s)
+      local q="$*"; [ -z "$q" ] && { _no "usage: arx weapons search <term>"; return 1; }
+      _title "weapons" "search · $q"
+      _wrows | grep -iE -- "$q" \
+        | awk -F'|' -v C="$_WC" -v R="$_WR" -v D="$_WD" '{printf "  %s%-22s%s %s%-9s%s %s%s%s\n", C,$1,R, D,tolower($3),R, D,substr($5,1,48),R}' | head -40 ;;
+    install|in|i|add)
+      local g="${1:-}"; [ -z "$g" ] && { _no "usage: arx weapons install <group>"; return 1; }
+      local list; list=$(_wrows | awk -F'|' -v G="$(printf '%s' "$g" | tr '[:lower:]' '[:upper:]')" 'toupper($3)==G{print $1}' | sort -u)
+      [ -z "$list" ] && { _no "no '$g' group (try: arx weapons)"; return 1; }
+      local cnt; cnt=$(printf '%s\n' "$list" | grep -c .)
+      _dim "$cnt tools in the ${g,,} group"
+      printf '%s\n' "$list" | head -8 | awk -v D="$_WD" -v R="$_WR" '{printf "    %s+%s %s\n", D, R, $1}'
+      [ "$cnt" -gt 8 ] && _dim "  ...and $((cnt-8)) more"
+      printf "\n"; op_install $list ;;
+    *)
+      local mc; mc=$(_wcode "$cmd")
+      if [ -n "$mc" ]; then
+        _title "weapons" "$(_wname "$mc")"
+        _wrows | awk -F'|' -v M="$mc" '$2==M{print $3}' | sort | uniq -c | sort -rn \
+          | awk -v C="$_WC" -v R="$_WR" -v D="$_WD" '{printf "  %s%-12s%s %s(%s tools)%s\n", C, tolower($2), R, D, $1, R}'
+        printf "\n"; _dim "list a group:  arx weapons <group>"; return 0
+      fi
+      local rows; rows=$(_wrows | awk -F'|' -v G="$(printf '%s' "$cmd" | tr '[:lower:]' '[:upper:]')" 'toupper($3)==G')
+      [ -z "$rows" ] && { _no "unknown group '$cmd' (try: arx weapons)"; return 1; }
+      _title "weapons" "${cmd,,}"
+      printf '%s\n' "$rows" | awk -F'|' -v C="$_WC" -v R="$_WR" -v D="$_WD" '{printf "  %s%-22s%s %s%s%s\n", C,$1,R, D,substr($5,1,54),R}'
+      printf "\n"; _dim "install all:  arx weapons install ${cmd,,}" ;;
+  esac
+}
+
+# ---- local / foreign package files: .deb .rpm .tar.* .pkg.tar.* .AppImage .zip ----
+_have_bsdtar(){ command -v bsdtar >/dev/null 2>&1 || sudo pacman -S --noconfirm --needed libarchive >/dev/null 2>&1; }
+
+_install_file(){
+  local f="$1" base
+  [ -f "$f" ] || { _title "install"; _no "no such file: $f"; return 1; }
+  f=$(readlink -f "$f"); base=$(basename "$f")
+  _title "install" "$base"
+  case "${base,,}" in
+    *.pkg.tar.zst|*.pkg.tar.xz|*.pkg.tar.gz|*.pkg.tar)
+      _auth; _confirm || return 0
+      _run "installing Arch package" sudo pacman -U --noconfirm "$f"
+      local rc=$?; [ $rc -eq 0 ] && _ok "installed: $base" || _no "$(_diagnose)"; return $rc ;;
+    *.deb)                                              _install_deb "$f" ;;
+    *.rpm)                                              _install_foreign "$f" ;;
+    *.appimage)                                         _install_appimage "$f" ;;
+    *.zip|*.tar.gz|*.tgz|*.tar.xz|*.tar.bz2|*.tar.zst|*.tar) _install_archive "$f" ;;
+    *) _no "unsupported package format: $base"; return 1 ;;
+  esac
+}
+
+_debfield(){ grep -m1 -i "^$2:" "$1" 2>/dev/null | cut -d: -f2- | sed 's/^[[:space:]]*//; s/[[:space:]]*$//'; }
+
+# --- intelligent Debian->Arch dependency resolution (uses the live pacman db, no external map) ---
+_arch_has(){ pacman -Si "$1" >/dev/null 2>&1; }      # is it a real repo package?
+_ensure_filesdb(){ pacman -Fq bash >/dev/null 2>&1 || { _dim "syncing the pacman files database (one-time)"; sudo pacman -Fy >/dev/null 2>&1; }; }
+
+# map one Debian dependency token to an Arch package name (echo it) or fail
+_deb_arch_candidate(){
+  local d c cand; d="${1%%:*}"; d=$(printf '%s' "$d" | tr 'A-Z' 'a-z' | tr -d '[:space:]')
+  [ -z "$d" ] && return 1
+  case "$d" in
+    libc6|libc-bin|libgcc-s1|libgcc1|libstdc++6|dpkg|debconf*|multiarch-support|base-files|install-info) return 1 ;;  # provided by Arch base / no-op
+    python3) echo python; return 0 ;;
+    python3-*) c="python-${d#python3-}" ;;
+    python-*) c="python2-${d#python-}" ;;
+    libssl*) c="openssl" ;;
+    zlib1g*) c="zlib" ;;
+    libcurl*) c="curl" ;;
+    libncurses*|libtinfo*) c="ncurses" ;;
+    libsqlite3*) c="sqlite" ;;
+    libx11-6) c="libx11" ;;
+    libgtk-3-0) c="gtk3" ;;  libgtk2.0-0) c="gtk2" ;;
+    default-jre|openjdk-*-jre*) c="jre-openjdk" ;;
+    default-jdk|openjdk-*-jdk*) c="jdk-openjdk" ;;
+    *) c="$d" ;;
+  esac
+  # try the mapped name, then progressively-stripped generic forms, and take the first that exists
+  for cand in "$c" "${c%-dev}" "${c%%[0-9]*}" "$(printf '%s' "$c" | sed 's/[0-9.]*$//')" "$(printf '%s' "$c" | sed 's/^lib//; s/[0-9.]*$//')"; do
+    cand="${cand%-}"; [ -n "$cand" ] && _arch_has "$cand" && { printf '%s' "$cand"; return 0; }
+  done
+  # library dependency: resolve by soname through the files database (libfoo5 -> the Arch package that ships libfoo.so)
+  case "$d" in lib*)
+    _ensure_filesdb
+    local so prov; so="${d%%[0-9]*}"
+    prov=$(pacman -Fq "${so}.so" 2>/dev/null | awk -F/ '{print $NF}' | sort -u | head -1)
+    [ -n "$prov" ] && { printf '%s' "$prov"; return 0; }
+  ;; esac
+  return 1
+}
+
+# resolve a .deb's Depends field to installable Arch package names (one per line, deduped)
+_deb_deps(){
+  local ctl="$1" raw
+  raw=$(_debfield "$ctl" Depends); [ -z "$raw" ] && return 0
+  printf '%s\n' "$raw" | tr ',' '\n' | while read -r dep; do
+    dep=$(printf '%s' "$dep" | sed 's/([^)]*)//g; s/^[[:space:]]*//; s/[[:space:]]*$//')
+    [ -z "$dep" ] && continue
+    local alt a                                       # "a | b" alternatives: first that resolves wins
+    for alt in ${dep//|/ }; do a=$(_deb_arch_candidate "$alt") && { printf '%s\n' "$a"; break; }; done
+  done | sort -u
+}
+
+# native .deb -> .pkg.tar.zst converter (a minimal, self-contained debtap; no AUR, no db download).
+# Prints the built package path on success. Reads control metadata, repackages data with a .PKGINFO
+# so pacman -U tracks and can cleanly remove it.
+_deb2pkg(){
+  local deb="$1" deps="$2" work ctar dtar ctl pkgname pkgver arch desc size final dl
+  work=$(mktemp -d) || return 1
+  ( cd "$work" && ar x "$deb" ) 2>/dev/null
+  ctar=$(ls "$work"/control.tar.* 2>/dev/null | head -1); dtar=$(ls "$work"/data.tar.* 2>/dev/null | head -1)
+  { [ -z "$ctar" ] || [ -z "$dtar" ]; } && { rm -rf "$work"; return 1; }
+  mkdir -p "$work/ctrl" "$work/pkg"
+  bsdtar -C "$work/ctrl" -xf "$ctar" 2>/dev/null; bsdtar -C "$work/pkg" -xf "$dtar" 2>/dev/null
+  ctl=$(ls "$work"/ctrl/control 2>/dev/null | head -1); [ -f "$ctl" ] || ctl="$work/ctrl/./control"
+  [ -f "$ctl" ] || { rm -rf "$work"; return 1; }
+  pkgname=$(_debfield "$ctl" Package | tr 'A-Z' 'a-z'); [ -z "$pkgname" ] && { rm -rf "$work"; return 1; }
+  pkgver=$(_debfield "$ctl" Version | sed 's/^[0-9]*://; s/-/./g; s/[^A-Za-z0-9._]/_/g'); [ -z "$pkgver" ] && pkgver=1.0
+  arch=$(_debfield "$ctl" Architecture)
+  case "$arch" in amd64) arch=x86_64;; arm64) arch=aarch64;; i386) arch=i686;; all|""|*any*) arch=any;; esac
+  desc=$(_debfield "$ctl" Description | head -1); size=$(du -sb "$work/pkg" 2>/dev/null | cut -f1)
+  { printf 'pkgname = %s\n' "$pkgname"
+    printf 'pkgbase = %s\n' "$pkgname"
+    printf 'pkgver = %s-1\n' "$pkgver"
+    printf 'pkgdesc = %s\n' "${desc:-converted from a .deb by ArxOS arx}"
+    printf 'builddate = %s\n' "$(date +%s)"
+    printf 'packager = ArxOS arx (deb2pkg)\n'
+    printf 'size = %s\n' "${size:-0}"
+    printf 'arch = %s\n' "$arch"
+    if [ -n "$deps" ]; then while read -r dl; do [ -n "$dl" ] && printf 'depend = %s\n' "$dl"; done <<<"$deps"; fi
+  } > "$work/pkg/.PKGINFO"
+  final=$(mktemp --suffix=.pkg.tar.zst)
+  ( cd "$work/pkg" && bsdtar -acf "$final" .PKGINFO $(ls -A | grep -v '^\.PKGINFO$') ) 2>/dev/null
+  rm -rf "$work"
+  [ -s "$final" ] && printf '%s' "$final" || { rm -f "$final"; return 1; }
+}
+
+_install_deb(){
+  local f="$1" base pkg rc; base=$(basename "$f"); _have_bsdtar
+  # read the .deb control file so we can resolve dependencies intelligently
+  local cdir ctl ctar; cdir=$(mktemp -d); ( cd "$cdir" && ar x "$f" ) 2>/dev/null
+  ctar=$(ls "$cdir"/control.tar.* 2>/dev/null | head -1); [ -n "$ctar" ] && bsdtar -C "$cdir" -xf "$ctar" 2>/dev/null
+  ctl=$(ls "$cdir"/control 2>/dev/null | head -1); [ -f "$ctl" ] || ctl="$cdir/./control"
+  _dim "converting $base to a pacman package"
+  local deps missing=() d
+  if [ -f "$ctl" ]; then
+    _dim "resolving dependencies against the Arch repositories…"
+    deps=$(_deb_deps "$ctl" 2>/dev/null)
+    while read -r d; do [ -n "$d" ] && ! pacman -Qq "$d" >/dev/null 2>&1 && missing+=("$d"); done <<<"$deps"
+  fi
+  if [ "${#missing[@]}" -gt 0 ]; then
+    _dim "missing dependencies - will pull these from the Arch repos:"
+    printf '    %s%s%s\n' "$C" "${missing[*]}" "$RS"
+  elif [ -n "$deps" ]; then
+    _dim "all resolvable dependencies are already installed"
+  fi
+  # primary: convert to a real pacman package natively (no debtap, no AUR), deps embedded so pacman tracks them
+  if pkg=$(_deb2pkg "$f" "$deps") && [ -n "$pkg" ]; then
+    _auth; _confirm || { rm -f "$pkg"; rm -rf "$cdir"; return 0; }
+    if [ "${#missing[@]}" -gt 0 ]; then
+      _run "installing ${#missing[@]} dependency(ies)" sudo pacman -S --noconfirm --needed "${missing[@]}" \
+        || { _no "could not install dependencies: ${missing[*]}"; rm -f "$pkg"; rm -rf "$cdir"; return 1; }
+    fi
+    _run "installing $base" sudo pacman -U --noconfirm "$pkg"; rc=$?; rm -f "$pkg"; rm -rf "$cdir"
+    [ $rc -eq 0 ] && { _ok "installed (pacman-tracked): $base"; return 0; }
+    _dim "pacman rejected the converted package - falling back to direct extraction"
+  else
+    rm -rf "$cdir"; _dim "native conversion failed - falling back to direct extraction"
+  fi
+  # last resort: unpack the .deb's data.tar into /
+  local tmp dt; tmp=$(mktemp -d); ( cd "$tmp" && ar x "$f" ) 2>/dev/null
+  dt=$(ls "$tmp"/data.tar.* 2>/dev/null | head -1)
+  [ -z "$dt" ] && { rm -rf "$tmp"; _no "not a valid .deb (no data.tar)"; return 1; }
+  _auth; _dim "extracting into / (not pacman-tracked)"; _confirm || { rm -rf "$tmp"; return 0; }
+  _run "extracting $base" sudo tar -C / -xpf "$dt"; rc=$?; rm -rf "$tmp"
+  [ $rc -eq 0 ] && { _ok "installed (extracted): $base"; _dim "files placed directly - pacman will not track these"; } || _no "extraction failed"
+  return $rc
+}
+
+_install_foreign(){  # .rpm (and anything libarchive reads) -> extract into /
+  local f="$1" base; base=$(basename "$f"); _have_bsdtar
+  _auth; _dim "extracting $base into / (not pacman-tracked)"; _confirm || return 0
+  _run "extracting" sudo bsdtar -C / -xpf "$f"; local rc=$?
+  [ $rc -eq 0 ] && { _ok "installed (extracted): $base"; _dim "not pacman-tracked"; } || _no "extraction failed"
+  return $rc
+}
+
+_install_archive(){  # generic tar/zip -> /opt/<name> (+ symlink any bin/)
+  local f="$1" base name dest; base=$(basename "$f"); _have_bsdtar
+  name="${base%.*}"; name="${name%.tar}"; dest="/opt/$name"
+  _dim "unpacking into $dest"; _auth; _confirm || return 0
+  sudo mkdir -p "$dest"
+  if _run "extracting $base" sudo bsdtar -C "$dest" -xpf "$f"; then
+    local b linked=0; shopt -s nullglob
+    for b in "$dest"/bin/* "$dest"/*/bin/*; do [ -f "$b" ] && [ -x "$b" ] && { sudo ln -sf "$b" /usr/local/bin/"$(basename "$b")"; linked=$((linked+1)); }; done
+    shopt -u nullglob
+    _ok "installed to $dest"; [ $linked -gt 0 ] && _dim "$linked binary(ies) linked into /usr/local/bin"
+  else _no "extraction failed"; return 1; fi
+}
+
+_install_appimage(){
+  local f="$1" base name dest; base=$(basename "$f"); name="${base%.*}"; dest="/opt/appimages"
+  _auth; sudo mkdir -p "$dest"
+  sudo cp "$f" "$dest/$base"; sudo chmod +x "$dest/$base"
+  sudo ln -sf "$dest/$base" /usr/local/bin/"${name,,}"
+  printf '[Desktop Entry]\nType=Application\nName=%s\nExec=%s\nTerminal=false\nCategories=Utility;\n' "$name" "$dest/$base" | sudo tee "/usr/share/applications/${name,,}.desktop" >/dev/null
+  _ok "installed AppImage: $base"; _dim "run '${name,,}' or launch it from the menu"
+}
+
+op_install(){
+  [ $# -eq 0 ] && { _title "install"; _no "no package specified"; return 1; }
+  # a local package FILE? (.deb .rpm .tar.* .pkg.tar.* .AppImage .zip) - install it directly
+  if [ -f "${1:-}" ] && printf '%s' "${1,,}" | grep -qE '\.(deb|rpm|appimage|zip|tgz|tar|tar\.(xz|bz2|zst|gz)|pkg\.tar\.[a-z]+)$'; then
+    local _rc=0 _f; for _f in "$@"; do _install_file "$_f" || _rc=1; done; return $_rc
+  fi
+  # ARXOS arsenal: "arx install weaponsCat <category|all>" installs a whole
+  # BlackArch arsenal group in real time (all = the entire arsenal).
+  if printf '%s' "${1:-}" | grep -qiE '^weapons?cat([-=].+)?$'; then
+    local _wc="$1"; shift
+    case "$_wc" in *[-=]*) set -- "${_wc#*[-=]}" "$@";; esac
+    op_weaponscat "$@"; return $?
+  fi
+  # inline alias: a weaponsCat-<x> / weaponCat-<x> token → blackarch-<x>
+  local _t=() _a; for _a in "$@"; do
+    case "$_a" in weapons[Cc]at-*|weapon[Cc]at-*) _t+=("blackarch-${_a#*at-}");; *) _t+=("$_a");; esac; done
+  set -- "${_t[@]}"
+  _title "install" "$*"
+  if ! pacman -Sp --print-format '%n %v' "$@" >"$LOG" 2>&1; then
+    if grep -qi 'target not found' "$LOG"; then
+      _dim "not in the repositories - building from the AUR"; printf "\n"
+      _ensure_yay || return 1
+      _aur_safety "$@" || return 1
+      _auth; _confirm || return 0
+      _run "building from AUR" yay -S --noconfirm "$@"; local rc=$?
+      [ $rc -eq 0 ] && _ok "installed from AUR: $*" || _no "$(_diagnose)"; return $rc
+    fi
+    _no "$(_diagnose)"; return 1
+  fi
+  local pkgs n; pkgs=$(grep -E '^[a-zA-Z0-9]' "$LOG"); n=$(printf '%s' "$pkgs" | grep -c .)
+  [ "${n:-0}" -gt 0 ] && { _dim "$n package(s) to install"; printf '%s\n' "$pkgs" | head -12 | awk -v D="$DM" -v R="$RS" '{printf "    %s+%s %s %s%s%s\n", D,R,$1,D,$2,R}'; printf "\n"; }
+  _auth; _confirm || return 0
+  _run "installing" sudo pacman -S --noconfirm "$@"
+  local rc=$?
+  [ $rc -eq 0 ] && _summary "installed" "${n:-0}" || _no "$(_diagnose)"
+  return $rc
+}
+
+_wcats(){ _wrows | awk -F'|' '{print tolower($3)}' | sort -u; }   # the ARXOS taxonomy SUB codes (same as `arx weapons <cat>`)
+# Install the whole arsenal in BATCHES so a single broken/unbuildable package can never abort or
+# block the rest. Batches of 150, then a per-package sweep for stragglers; broken upstream packages
+# are skipped (not the user's fault) and reported. Never hard-fails - the end user always ends with
+# a clean, finished install of everything that CAN install.
+_arsenal_full(){
+  local total="$1" sf; sf=$(mktemp /tmp/.arxfull.XXXXXX.sh)
+  cat >"$sf" <<'SCRIPT'
+#!/usr/bin/env bash
+PKGS=$(/usr/bin/pacman -Sg blackarch | awk '{print $2}' | sort -u)
+rem(){ comm -23 <(printf '%s\n' "$PKGS") <(pacman -Qq 2>/dev/null | sort -u); }
+for pass in 1 2 3; do
+  R=$(rem); [ -z "$R" ] && break
+  printf '%s\n' "$R" | grep . | split -l 150 - /tmp/.arxcat.
+  for f in /tmp/.arxcat.*; do
+    # shellcheck disable=SC2046
+    /usr/bin/pacman -Sy --needed --noconfirm --ask=4 --overwrite '*' --disable-download-timeout $(tr '\n' ' ' < "$f") || true
+  done
+  rm -f /tmp/.arxcat.*
+done
+# final per-package sweep: one broken package can't block its neighbours
+for p in $(rem); do /usr/bin/pacman -S --needed --noconfirm --ask=4 --overwrite '*' "$p" >/dev/null 2>&1 || echo "SKIP $p"; done
+exit 0
+SCRIPT
+  _run "installing the full arsenal ($total tools · batched, broken upstream skipped)" sudo bash "$sf"
+  rm -f "$sf"
+  local have; have=$(comm -12 <(/usr/bin/pacman -Sg blackarch 2>/dev/null | awk '{print $2}' | sort -u) <(pacman -Qq 2>/dev/null | sort -u) | wc -l | tr -d ' ')
+  local miss=$(( total - have ))
+  _summary "installed" "$have"
+  [ "$miss" -gt 0 ] && _dim "$miss package(s) skipped: a broken upstream build/dependency (not an ArxOS or device fault) - everything installable is in"
+  return 0
+}
+
+op_weaponscat(){
+  local cat="${1:-}"
+  if [ -z "$cat" ]; then
+    _title "install" "weaponsCat"
+    _no "usage: arx install weaponsCat <category|full>"
+    local cats; cats=$(_wcats | paste -sd' ' -)
+    [ -n "$cats" ] && { _dim "arsenal categories (same as 'arx weapons'):"; printf "    %s\n\n" "$cats"; }
+    _dim "a whole menu:        arx install weaponsCat offensive|bugbounty|defensive|research"
+    _dim "everything at once:  arx install weaponsCat full"
+    return 1
+  fi
+  _title "install" "weaponsCat · ${cat,,}"
+  # full/everything/all -> the entire arsenal (the internal base group; the name is
+  # NEVER surfaced - OPSEC: ARXOS must not read as a customized arsenal distro).
+  case "${cat,,}" in
+    full|everything|all)
+      local n; n=$(/usr/bin/pacman -Sg blackarch 2>/dev/null | wc -l | tr -d ' ')
+      [ "${n:-0}" -eq 0 ] && { _no "the arsenal base is not available (repo not configured)"; return 1; }
+      _dim "the full ARXOS arsenal · $n tools · this is large (tens of GB)"
+      _dim "installed in batches; a broken upstream package is skipped so the install always finishes cleanly"
+      _auth; _confirm || return 0
+      _arsenal_full "$n"
+      return $? ;;
+  esac
+  # otherwise a category from the ARXOS taxonomy - the SAME codes `arx weapons <cat>`
+  # browses: a whole MENU (offensive/bugbounty/defensive/research) or a SUB group
+  # (c2/recon/web/exp/pwd/...). Resolve to the concrete tool set and install it.
+  local mc list; mc=$(_wcode "$cat")
+  if [ -n "$mc" ]; then list=$(_wrows | awk -F'|' -v M="$mc" '$2==M{print $1}' | sort -u)
+  else                  list=$(_wrows | awk -F'|' -v G="$(printf '%s' "$cat" | tr '[:lower:]' '[:upper:]')" 'toupper($3)==G{print $1}' | sort -u); fi
+  if [ -z "$list" ]; then
+    _no "no arsenal category '$cat'"
+    _dim "list categories:  arx install weaponsCat"
+    return 1
+  fi
+  local n; n=$(printf '%s\n' "$list" | grep -c .)
+  _dim "$n tools in the ${cat,,} arsenal"
+  op_install $list
+}
+
+op_remove(){
+  [ $# -eq 0 ] && { _title "remove"; _no "no package specified"; return 1; }
+  _title "remove" "$*"
+  if ! pacman -Rs --print "$@" >"$LOG" 2>&1; then _no "$(_diagnose)"; return 1; fi
+  local pkgs n; pkgs=$(grep -E '^[a-zA-Z0-9/]' "$LOG"); n=$(printf '%s' "$pkgs" | grep -c .)
+  [ "${n:-0}" -gt 0 ] && { _dim "$n package(s) to remove"; printf '%s\n' "$pkgs" | sed 's#.*/##' | head -12 | awk -v D="$DM" -v R="$RS" '{printf "    %s-%s %s\n", D,R,$1}'; printf "\n"; }
+  _auth; _confirm || return 0
+  _run "removing" sudo pacman -Rns --noconfirm "$@"
+  local rc=$?
+  [ $rc -eq 0 ] && _summary "removed" "${n:-0}" || _no "$(_diagnose)"
+  return $rc
+}
+
+op_search(){
+  [ $# -eq 0 ] && { _title "search"; _no "no search term"; return 1; }
+  local mode=all a; local -a terms=()
+  for a in "$@"; do case "$a" in
+    -r|--repo|--pacman) mode=repo ;;
+    -a|--aur)           mode=aur  ;;
+    *) terms+=("$a") ;;
+  esac; done
+  [ ${#terms[@]} -eq 0 ] && { _title "search"; _no "no search term"; return 1; }
+  _title "search" "${terms[*]}"
+  local found=0
+  # kick off the AUR fetch concurrently so it overlaps the repo search + render
+  local _aurtmp="" _aurpid=""
+  if [ "$mode" != repo ]; then
+    local q; q=$(printf '%s' "${terms[*]}" | sed 's/ /+/g')
+    _aurtmp=$(mktemp 2>/dev/null)
+    curl -fsSL -g --max-time 8 "https://aur.archlinux.org/rpc/v5/search?by=name-desc&arg=$q" >"$_aurtmp" 2>/dev/null &
+    _aurpid=$!
+  fi
+  # official repositories (instant). Native core first (offline, ~17x); pacman -Ss is the fallback.
+  if [ "$mode" != aur ]; then
+    if _arxcore; then
+      local _acout; _acout=$("$ARXCORE" search "${terms[@]}" 2>/dev/null)
+      if [ -n "$_acout" ]; then
+        [ "$mode" = all ] && printf "  ${DM}official repositories${RS}\n"
+        printf '%s\n' "$_acout" | while IFS=$'\t' read -r repo name ver inst desc; do
+          instr=""; [ "$inst" = 1 ] && instr="  ${GR}[installed]${RS}"
+          printf "  ${CB}%s${RS} ${DM}%s${RS}  ${DM}%s${RS}%s\n" "$name" "$ver" "$repo" "$instr"
+          printf "    %s\n" "$desc"
+        done
+        found=1
+      fi
+    else
+      pacman --color never -Ss "${terms[@]}" >"$LOG" 2>&1
+      if grep -qiE 'Resolving timed out|could not resolve' "$LOG"; then _no "$(_diagnose)"; return 1; fi
+      if [ -s "$LOG" ] && grep -qE '^[a-z0-9]' "$LOG"; then
+        [ "$mode" = all ] && printf "  ${DM}official repositories${RS}\n"
+        awk -v CB="$CB" -v DM="$DM" -v GR="$GR" -v Z="$RS" '
+          /^[a-z0-9]/ { split($1,a,"/"); name=a[2];
+            inst=(index($0,"[installed")>0)?"  " GR "[installed]" Z:"";
+            printf "  " CB "%s" Z " " DM "%s" Z "  " DM "%s" Z "%s\n", name,$2,a[1],inst; next }
+          { sub(/^[ \t]+/,""); printf "    %s\n",$0 }' "$LOG"
+        found=1
+      fi
+    fi
+  fi
+  # AUR via the AUR RPC (works WITHOUT yay; name+description match, so it surfaces similar
+  # names too). Just lists findings - it never installs. Sorted by votes.
+  if [ "$mode" != repo ]; then
+    [ -n "$_aurpid" ] && wait "$_aurpid" 2>/dev/null
+    local aurjson; aurjson=$(cat "$_aurtmp" 2>/dev/null); rm -f "$_aurtmp" 2>/dev/null
+    local aurout=""
+    [ -n "$aurjson" ] && aurout=$(printf '%s' "$aurjson" | python3 -c '
+import sys,json
+try: rs=json.load(sys.stdin).get("results",[])
+except Exception: sys.exit(0)
+rs.sort(key=lambda r:-(r.get("NumVotes") or 0))
+for r in rs[:40]:
+    ood=" <out-of-date>" if r.get("OutOfDate") else ""
+    print("\t".join([r.get("Name",""), r.get("Version",""), str(r.get("NumVotes",0)), (r.get("Description") or "").replace("\n"," ").replace("\t"," "), ood]))' 2>/dev/null)
+    if [ -n "$aurout" ]; then
+      [ "$mode" = all ] && printf "\n  ${DM}AUR${RS}\n"
+      declare -A _INST; local _p; while read -r _p; do _INST[$_p]=1; done < <(pacman -Qq 2>/dev/null)
+      printf '%s\n' "$aurout" | while IFS=$'\t' read -r name ver votes desc ood; do
+        inst=""; [ -n "${_INST[$name]:-}" ] && inst="  ${GR}[installed]${RS}"
+        printf "  ${C}%s${RS} ${DM}%s${RS}  ${DM}aur · %s votes${RS}${RD}%s${RS}%s\n" "$name" "$ver" "$votes" "$ood" "$inst"
+        printf "    ${DM}%s${RS}\n" "$desc"
+      done
+      found=1
+    fi
+  fi
+  [ "$found" -eq 0 ] && _dim "no results"
+  [ "$found" -eq 1 ] && printf "\n  ${DM}install one with:  arx install <name>${RS}\n"
+  printf "\n"
+}
+
+op_info(){
+  [ $# -eq 0 ] && { _title "info"; _no "no package specified"; return 1; }
+  _title "info" "$*"
+  pacman -Si "$@" 2>/dev/null \
+    || { command -v yay >/dev/null 2>&1 && yay -Si "$@" 2>/dev/null; } \
+    || pacman -Qi "$@" 2>/dev/null \
+    || _no "$(_diagnose)"
+  printf "\n"
+}
+
+op_clean(){
+  _title "cache clean"
+  _auth
+  if command -v paccache >/dev/null 2>&1; then
+    _quiet "trimming cache" bash -c 'sudo paccache -rk2; sudo paccache -ruk0'
+  else
+    _quiet "trimming cache" sudo pacman -Sc --noconfirm
+  fi
+  _ok "cache trimmed"
+}
+
+op_orphans(){
+  _title "orphan sweep"
+  local orphs; orphs=$(pacman -Qtdq 2>/dev/null)
+  if [ -z "$orphs" ]; then _ok "no orphaned packages"; return 0; fi
+  local n; n=$(printf '%s\n' "$orphs" | grep -c .)
+  _dim "$n orphan(s)"; printf '%s\n' "$orphs" | head -15 | awk -v D="$DM" -v R="$RS" '{printf "    %s-%s %s\n", D,R,$1}'; printf "\n"
+  _auth; _confirm || return 0
+  _quiet "removing orphans" bash -c "pacman -Qtdq | sudo pacman -Rns --noconfirm -"
+  local rc=$?
+  [ $rc -eq 0 ] && _ok "orphans removed" || _no "$(_diagnose)"
+}
+
+op_aur(){
+  [ $# -eq 0 ] && { _title "AUR"; _no "no package specified"; return 1; }
+  _ensure_yay || return 1
+  _title "AUR install" "$*"
+  _aur_safety "$@" || return 1
+  _run "building" yay -S --noconfirm "$@"
+  local rc=$?
+  [ $rc -eq 0 ] && _ok "installed from AUR: $*" || _no "$(_diagnose)"
+}
+
+# Keyring names present on this system (archlinux + blackarch + cachyos).
+_keyrings(){ # echoes "populate-names|keyring-packages"
+  local pop="archlinux" pkgs="archlinux-keyring"
+  pacman -Qq blackarch-keyring >/dev/null 2>&1 && { pop="$pop blackarch"; pkgs="$pkgs blackarch-keyring"; }
+  pacman -Qq cachyos-keyring   >/dev/null 2>&1 && { pop="$pop cachyos";   pkgs="$pkgs cachyos-keyring"; }
+  printf '%s|%s' "$pop" "$pkgs"
+}
+
+op_mirrors(){
+  _title "mirror refresh"
+  _auth
+  if ! command -v reflector >/dev/null 2>&1; then
+    _quiet "installing reflector" sudo pacman -S --noconfirm reflector || { _no "could not install reflector"; return 1; }
+  fi
+  _quiet "ranking fastest mirrors" sudo bash -c 'reflector --latest 20 --sort rate --protocol https,http --save /etc/pacman.d/mirrorlist'
+  [ $? -ne 0 ] && { _no "$(_diagnose)"; return 1; }
+  _quiet "refreshing databases" sudo pacman -Syy
+  [ $? -eq 0 ] && _ok "mirrors ranked + databases refreshed" || _no "$(_diagnose)"
+}
+
+op_keys(){
+  _title "keyring repair"
+  _auth
+  local kr; kr=$(_keyrings); local pop="${kr%|*}" pkgs="${kr#*|}"
+  _quiet "initialising keyring" sudo pacman-key --init
+  _quiet "populating keys"      sudo pacman-key --populate $pop
+  _quiet "updating keyrings"    sudo pacman -Sy --noconfirm $pkgs
+  [ $? -eq 0 ] && _ok "keyring repaired - signatures should validate now" || _no "$(_diagnose)"
+}
+
+op_fix(){
+  _title "repair"
+  _auth
+  if [ -f /var/lib/pacman/db.lck ] && ! pgrep -x pacman >/dev/null 2>&1; then
+    sudo rm -f /var/lib/pacman/db.lck && _ok "removed stale database lock"
+  fi
+  local kr; kr=$(_keyrings); local pop="${kr%|*}" pkgs="${kr#*|}"
+  _quiet "repairing keyring" sudo pacman-key --init
+  _quiet "populating keys"   sudo pacman-key --populate $pop
+  command -v reflector >/dev/null 2>&1 && \
+    _quiet "ranking mirrors" sudo bash -c 'reflector --latest 20 --sort rate --protocol https,http --save /etc/pacman.d/mirrorlist'
+  _quiet "force-refreshing databases" sudo pacman -Syy --noconfirm $pkgs
+  [ $? -eq 0 ] && _ok "repair complete - lock, keyring, mirrors + databases" || _no "$(_diagnose)"
+}
+
+op_downgrade(){
+  [ $# -eq 0 ] && { _title "downgrade"; _no "no package specified"; return 1; }
+  _title "downgrade" "$*"; _auth
+  if command -v downgrade >/dev/null 2>&1; then sudo downgrade "$@"; return $?; fi
+  local p="$1" f
+  f=$(ls -t /var/cache/pacman/pkg/"$p"-[0-9]*.pkg.tar.* 2>/dev/null | sed -n '2p')
+  [ -z "$f" ] && f=$(ls -t /var/cache/pacman/pkg/"$p"-[0-9]*.pkg.tar.* 2>/dev/null | head -1)
+  [ -z "$f" ] && { _no "no cached version of $p found (install 'downgrade' for full support)"; return 1; }
+  _dim "rolling back to $(basename "$f")"
+  _quiet "downgrading" sudo pacman -U --noconfirm "$f"
+  [ $? -eq 0 ] && _ok "downgraded: $p" || _no "$(_diagnose)"
+}
+
+op_list(){
+  _title "installed packages" "${1:-}"
+  # native core (explicit installs, offline) with pacman -Qe as the fallback; same "name version" rows
+  local _lst
+  if _arxcore; then _lst=$("$ARXCORE" list 2>/dev/null); else _lst=$(pacman -Qe 2>/dev/null); fi
+  printf '%s\n' "$_lst" | awk -v C="$CB" -v D="$DM" -v R="$RS" -v f="${1:-}" \
+    'f=="" || index($1,f){printf "  " C "%s" R "  " D "%s" R "\n",$1,$2}'
+  printf "\n  ${DM}%s explicitly-installed package(s)${RS}\n\n" "$(printf '%s\n' "$_lst" | grep -c .)"
+}
+
+op_owns(){
+  [ $# -eq 0 ] && { _title "owns"; _no "no file specified"; return 1; }
+  _title "owns" "$*"
+  pacman -Qo "$@" 2>&1 | sed 's/^/  /'; printf "\n"
+}
+
+op_files(){
+  [ $# -eq 0 ] && { _title "files"; _no "no package specified"; return 1; }
+  _title "files" "$*"
+  if ! pacman -Fl "$@" 2>/dev/null | awk '{print "  "$2}' | grep -q .; then
+    _auth; _quiet "syncing file database" sudo pacman -Fy
+    pacman -Fl "$@" 2>/dev/null | awk '{print "  "$2}'
+  fi
+  printf "\n"
+}
+
+op_outdated(){
+  _title "available updates"
+  local repo aur nr=0 na=0
+  repo=$(checkupdates 2>/dev/null); nr=$(printf '%s' "$repo" | grep -c .)
+  [ "$nr" -gt 0 ] && { printf "  ${DM}repositories (%d)${RS}\n" "$nr"; printf '%s\n' "$repo" | awk -v C="$C" -v R="$RS" '{printf "    %s%s%s\n",C,$0,R}' | head -50; }
+  if command -v yay >/dev/null 2>&1; then
+    aur=$(yay -Qua 2>/dev/null); na=$(printf '%s' "$aur" | grep -c .)
+    [ "$na" -gt 0 ] && { printf "\n  ${DM}AUR (%d)${RS}\n" "$na"; printf '%s\n' "$aur" | awk -v C="$C" -v R="$RS" '{printf "    %s%s%s\n",C,$0,R}'; }
+  fi
+  local n=$((nr+na)); printf "\n"
+  [ "$n" -eq 0 ] && _ok "system is up to date" || printf "  ${GR}>>${RS} %d update(s) available - run ${C}arx update${RS}\n\n" "$n"
+}
+
+op_provides(){
+  [ $# -eq 0 ] && { _title "provides"; _no "no file specified"; return 1; }
+  _title "provides" "$*"
+  pacman -F "$@" >/dev/null 2>&1 || { _auth; _quiet "syncing file database" sudo pacman -Fy; }
+  pacman -F "$@" 2>&1 | sed 's/^/  /'; printf "\n"
+}
+
+op_help(){
+  printf "\n  ${GB}arx${RS} ${DM}- ARXOS package manager${RS}\n\n"
+  printf "  ${DM}packages${RS}\n"
+  printf "  ${C}%-22s${RS}%s\n" "update"          "upgrade system + ARXOS tools (unified)"
+  printf "  ${C}%-22s${RS}%s\n" "tools"           "sync ARXOS's own tools only"
+  printf "  ${C}%-22s${RS}%s\n" "weapons [grp]"   "browse / install the arsenal (Offensive/BugBounty/Defensive/Research)"
+  printf "  ${C}%-22s${RS}%s\n" "install <pkg>"   "install package(s)"
+  printf "  ${C}%-22s${RS}%s\n" "remove <pkg>"    "remove package(s) + deps"
+  printf "  ${C}%-22s${RS}%s\n" "downgrade <pkg>" "roll a package back"
+  printf "  ${C}%-22s${RS}%s\n" "aur <pkg>"       "install from the AUR"
+  printf "  ${C}%-22s${RS}%s\n" "install <file>"  ".deb, .rpm, .tar.*, .pkg.tar.*, .AppImage, .zip"
+  printf "  ${C}%-22s${RS}%s\n" "pip install <pkg>" "install Python packages with system-package override"
+  printf "\n  ${DM}query${RS}\n"
+  printf "  ${C}%-22s${RS}%s\n" "search <term>"   "search repositories"
+  printf "  ${C}%-22s${RS}%s\n" "info <pkg>"      "package details"
+  printf "  ${C}%-22s${RS}%s\n" "list [filter]"   "installed packages"
+  printf "  ${C}%-22s${RS}%s\n" "owns <file>"     "which package owns a file"
+  printf "  ${C}%-22s${RS}%s\n" "files <pkg>"     "list a package's files"
+  printf "  ${C}%-22s${RS}%s\n" "outdated"        "list available updates (no install)"
+  printf "  ${C}%-22s${RS}%s\n" "provides <file>" "which repo package provides a file"
+  printf "\n  ${DM}maintenance${RS}\n"
+  printf "  ${C}%-22s${RS}%s\n" "mirrors"         "rank the fastest mirrors"
+  printf "  ${C}%-22s${RS}%s\n" "keys"            "repair keyring / signatures"
+  printf "  ${C}%-22s${RS}%s\n" "fix"             "repair lock, keys, mirrors, db"
+  printf "  ${C}%-22s${RS}%s\n" "clean"           "trim the package cache"
+  printf "  ${C}%-22s${RS}%s\n" "orphans"         "remove orphaned deps"
+  printf "\n  ${DM}-y/--yes assume yes  ·  arx <pkg> installs directly${RS}\n\n"
+}
+
+# ---------------- dispatch ----------------
+ARGS=()
+for a in "$@"; do
+  case "$a" in
+    -y|--yes|--noconfirm) ASSUME_YES=1 ;;
+    *) ARGS+=("$a") ;;
+  esac
+done
+set -- "${ARGS[@]}"
+verb="${1:-}"; [ $# -gt 0 ] && shift
+
+case "$verb" in
+  up|update|upgrade|sync|syu)   op_upgrade_all "$@" ;;
+  system|sys|sysupgrade)        op_update "$@" ;;
+  tools|self|selfupdate|self-update) op_tools ;;
+  in|install|i|add)             op_install "$@" ;;
+  weapons|arsenal|w)            op_weapons "$@" ;;
+  rm|remove|r|del|uninstall)    op_remove "$@" ;;
+  se|search|s|find|q)           op_search "$@" ;;
+  if|info|show)                 op_info "$@" ;;
+  cl|clean|cc)                  op_clean ;;
+  orphans|autoremove|sweep)     op_orphans ;;
+  aur)                          op_aur "$@" ;;
+  pip|pip3)                     op_pip "$@" ;;
+  mirrors|mirror|rank)          op_mirrors ;;
+  keys|keyring|key)             op_keys ;;
+  fix|repair|doctor)            op_fix ;;
+  downgrade|dg|roll)            op_downgrade "$@" ;;
+  list|ls|installed)            op_list "$@" ;;
+  owns|owner|whoowns)           op_owns "$@" ;;
+  files|filelist|fl)            op_files "$@" ;;
+  outdated|updates|checkupdates) op_outdated ;;
+  provides|whatprovides|prov)   op_provides "$@" ;;
+  rdd|force-remove)             _auth; _run "force-removing (ignoring deps)" sudo pacman -Rdd --noconfirm "$@" ;;
+  sq|ss)                        op_search "$@" ;;
+  # raw pacman passthrough for power users - full flags + regex (^, $, [], etc.)
+  -Q*|-T*|-F*|-V)               pacman "$verb" "$@" ;;              # read-only: -Qs, -Qtdq, -Ss via -S below, -Fl …
+  -S[silgpq]*)                  pacman "$verb" "$@" ;;              # -Ss ^term / -Si / -Sl / -Sg / -Sp / -Sq (read, regex ok)
+  -S*|-R*|-U*|-D*)              _auth; sudo pacman "$verb" "$@" ;;  # write: -S, -Rdd, -Rns, -Syu, -U, -D …
+  ""|-h|--help|help)            op_help ;;
+  *)                            op_install "$verb" "$@" ;;
+esac
