@@ -3,121 +3,69 @@
 # No yay/paru dependency. AUR metadata is fetched directly from the AUR RPC,
 # sources are cloned from AUR git, and Arch's makepkg remains the package-build boundary.
 set -euo pipefail
-
 AUR_RPC=${ARX_AUR_RPC:-https://aur.archlinux.org/rpc/v5}
 AUR_CACHE=${ARX_AUR_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/arx/aur}
 ASSUME_YES=0
-
 _die(){ printf 'arx-aur: error: %s\n' "$*" >&2; exit 1; }
 _have(){ command -v "$1" >/dev/null 2>&1 || _die "required command not found: $1"; }
-_have curl; _have git; _have makepkg; _have python3
+_have curl; _have git; _have makepkg; _have python3; _have flock
 mkdir -p "$AUR_CACHE"
-
-rpc(){
-  local path=$1
-  curl --fail --silent --show-error --retry 3 --retry-delay 1 --connect-timeout 5 --max-time 20 \
-    -H 'Accept: application/json' "$AUR_RPC/$path"
-}
-
-json_lines(){
-  python3 -c 'import json,sys
+rpc(){ curl --fail --silent --show-error --retry 3 --retry-delay 1 --connect-timeout 5 --max-time 20 -H 'Accept: application/json' "$AUR_RPC/$1"; }
+json_lines(){ python3 -c 'import json,sys
 x=json.load(sys.stdin)
-for r in x.get("results",[]):
- print("\t".join(str(r.get(k,"")) for k in ("Name","Version","Description","Maintainer","NumVotes","Popularity","OutOfDate")))'
-}
-
+for r in x.get("results",[]): print("\t".join(str(r.get(k,"")) for k in ("Name","Version","Description","Maintainer","NumVotes","Popularity","OutOfDate")))'; }
 search(){
   [ $# -gt 0 ] || _die 'usage: arx-aur search <term>'
   local q; q=$(python3 -c 'import urllib.parse,sys; print(urllib.parse.quote(" ".join(sys.argv[1:])))' "$@")
-  rpc "search?by=name-desc&arg=$q" | json_lines | while IFS=$'\t' read -r n v d m votes pop ood; do
-    printf '%-30s %-20s %8s  %s\n' "$n" "$v" "$votes" "${d:-no description}"
-  done
+  rpc "search?by=name-desc&arg=$q" | json_lines | while IFS=$'\t' read -r n v d m votes pop ood; do printf '%-30s %-20s %8s  %s\n' "$n" "$v" "$votes" "${d:-no description}"; done
 }
-
 info(){
   [ $# -gt 0 ] || _die 'usage: arx-aur info <pkg>'
   local p j; for p in "$@"; do
     j=$(rpc "info?arg=$(python3 -c 'import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))' "$p")") || continue
-    python3 - "$p" <<'PY' <<<"$j"
-import json,sys
-x=json.load(sys.stdin); r=(x.get('results') or [None])[0]
+    printf '%s\n' "$j" | python3 -c 'import json,sys
+x=json.load(sys.stdin); r=(x.get("results") or [None])[0]
 if not r: sys.exit(1)
-for k in ('Name','Version','Description','URL','Maintainer','FirstSubmitted','LastModified','NumVotes','Popularity','OutOfDate'):
-    print(f'{k}: {r.get(k,"")}')
-PY
+for k in ("Name","Version","Description","URL","Maintainer","FirstSubmitted","LastModified","NumVotes","Popularity","OutOfDate"): print(f"{k}: {r.get(k,\"\")}")'
   done
 }
-
 pkg_src(){ printf 'https://aur.archlinux.org/%s.git' "$1"; }
-
 build_one(){
   local pkg=$1 root="$AUR_CACHE/$1" lock="$AUR_CACHE/.${1}.lock"
-  mkdir -p "$AUR_CACHE"
-  exec 9>"$lock"
-  flock -n 9 || _die "$pkg is already being built by another arx process"
-  if [ -d "$root/.git" ]; then
-    git -C "$root" fetch --quiet origin master
-    git -C "$root" reset --hard --quiet origin/master
-  else
-    rm -rf "$root.tmp"
-    git clone --quiet --depth=1 "$(pkg_src "$pkg")" "$root.tmp"
-    mv "$root.tmp" "$root"
-  fi
-
-  # Keep a source snapshot for reproducibility and let the caller decide whether
-  # to inspect the PKGBUILD. makepkg executes PKGBUILD code, so this is an explicit
-  # trust boundary rather than pretending an AUR package is equivalent to a binary repo package.
-  cp -f "$root/PKGBUILD" "$root/PKGBUILD.arx-reviewed" 2>/dev/null || true
-  local -a args=(--syncdeps --install --needed)
-  [ "$ASSUME_YES" -eq 1 ] && args+=(--noconfirm)
-  cd "$root"
-  makepkg "${args[@]}"
+  mkdir -p "$AUR_CACHE"; exec 9>"$lock"; flock -n 9 || _die "$pkg is already being built by another arx process"
+  if [ -d "$root/.git" ]; then git -C "$root" fetch --quiet origin master && git -C "$root" reset --hard --quiet origin/master; else rm -rf "$root.tmp"; git clone --quiet --depth=1 "$(pkg_src "$pkg")" "$root.tmp"; mv "$root.tmp" "$root"; fi
+  [ -f "$root/PKGBUILD" ] || _die "$pkg: AUR repository has no PKGBUILD"
+  cp -f "$root/PKGBUILD" "$root/PKGBUILD.arx-snapshot"
+  local -a args=(--syncdeps --install --needed); [ "$ASSUME_YES" -eq 1 ] && args+=(--noconfirm)
+  cd "$root"; makepkg "${args[@]}"
 }
-
 install_pkgs(){
   [ $# -gt 0 ] || _die 'usage: arx-aur install [-y] <pkg...>'
-  local p
-  for p in "$@"; do
-    [[ "$p" =~ ^[A-Za-z0-9@._+:-]+$ ]] || _die "invalid AUR package name: $p"
-    printf ':: ARX AUR build: %s\n' "$p"
-    build_one "$p"
-  done
+  local p; for p in "$@"; do [[ "$p" =~ ^[A-Za-z0-9@._+:-]+$ ]] || _die "invalid AUR package name: $p"; printf ':: ARX AUR build: %s\n' "$p"; build_one "$p"; done
 }
-
 upgrade(){
-  local tmp="$AUR_CACHE/.upgrade.json"; rpc 'search?by=maintainer&arg=' >/dev/null 2>&1 || true
-  # AUR does not expose a single authoritative upgrade endpoint. ARX delegates
-  # installed-package discovery to pacman and checks each installed AUR name with RPC.
   pacman -Qqm 2>/dev/null | while read -r p; do
     [ -n "$p" ] || continue
-    local j cur remote
-    cur=$(pacman -Q "$p" | awk '{print $2}')
+    local j cur remote; cur=$(pacman -Q "$p" | awk '{print $2}')
     j=$(rpc "info?arg=$(python3 -c 'import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))' "$p")" 2>/dev/null) || continue
-    remote=$(python3 -c 'import json,sys; x=json.load(sys.stdin); r=(x.get("results") or [{}])[0]; print(r.get("Version", ""))' <<<"$j")
+    remote=$(printf '%s\n' "$j" | python3 -c 'import json,sys; x=json.load(sys.stdin); r=(x.get("results") or [{}])[0]; print(r.get("Version", ""))')
     [ -n "$remote" ] && [ "$remote" != "$cur" ] && printf '%s\t%s\t%s\n' "$p" "$cur" "$remote"
   done
-  rm -f "$tmp"
 }
-
 usage(){ cat <<'EOF'
 arx-aur: native AUR client for ARXOS
-
   arx-aur search <term>...
   arx-aur info <pkg>...
   arx-aur install [-y] <pkg>...
   arx-aur upgrade
-
-Environment:
-  ARX_AUR_CACHE   cache/build directory (default: ~/.cache/arx/aur)
-  ARX_AUR_RPC     AUR RPC endpoint
+Environment: ARX_AUR_CACHE, ARX_AUR_RPC
 EOF
 }
-
 case "${1:-}" in
-  search|s) shift; search "$@" ;;
-  info|i) shift; info "$@" ;;
-  install|-S) shift; while [ $# -gt 0 ]; do case "$1" in -y|--yes|--noconfirm) ASSUME_YES=1; shift;; *) break;; esac; done; install_pkgs "$@" ;;
-  upgrade|-Su) shift; upgrade ;;
-  -h|--help|'') usage ;;
-  *) _die "unknown command '$1' (use --help)" ;;
+ search|s) shift; search "$@";;
+ info|i) shift; info "$@";;
+ install|-S) shift; while [ $# -gt 0 ]; do case "$1" in -y|--yes|--noconfirm) ASSUME_YES=1; shift;; *) break;; esac; done; install_pkgs "$@";;
+ upgrade|-Su) shift; upgrade;;
+ -h|--help|'') usage;;
+ *) _die "unknown command '$1' (use --help)";;
 esac
