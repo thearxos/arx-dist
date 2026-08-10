@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# ARX self-replacement patcher. Replaces installed ARX scripts atomically.
+set -euo pipefail
+umask 022
+PREFIX=${ARX_PREFIX:-/usr/local/bin}
+BACKUP=${ARX_PATCH_BACKUP:-/var/lib/arx/patch-backups}
+MANIFEST=${ARX_PATCH_MANIFEST:-/var/lib/arx/patch-manifest}
+REPO_ROOT=${ARX_REPO_ROOT:-$(cd "$(dirname "$0")" && pwd)}
+
+usage(){ echo 'usage: arx-patch apply <file...> | rollback <file>'; }
+need(){ command -v "$1" >/dev/null 2>&1 || { echo "arx-patch: missing $1" >&2; exit 127; }; }
+backup(){ local dst=$1 stamp; stamp=$(date +%Y%m%d-%H%M%S); mkdir -p "$BACKUP"; if [ -e "$dst" ]; then cp -a -- "$dst" "$BACKUP/$(basename "$dst").$stamp"; printf '%s\t%s\n' "$dst" "$BACKUP/$(basename "$dst").$stamp" >> "$MANIFEST"; fi; }
+install_one(){ local src=$1 name dst tmp; name=$(basename "$src"); dst="$PREFIX/$name"; [ -f "$src" ] || { echo "missing patch source: $src" >&2; return 1; }; backup "$dst"; tmp=$(mktemp "$PREFIX/.arx-patch.XXXXXX"); install -m 0755 "$src" "$tmp"; mv -f -- "$tmp" "$dst"; echo "> > patched $dst"; }
+apply(){ [ $# -gt 0 ] || { usage; exit 2; }; mkdir -p "$PREFIX" "$BACKUP"; touch "$MANIFEST"; local src; for src in "$@"; do install_one "$src"; done; }
+rollback(){ local name=$1 line dst src; [ -n "$name" ] || { usage; exit 2; }; line=$(grep -E "/$(printf '%s' "$name" | sed 's/[.[\*^$(){}+?|\\]/\\&/g')\.[0-9]{8}-[0-9]{6}$" "$MANIFEST" | tail -n1 || true); [ -n "$line" ] || { echo "no backup for $name" >&2; exit 1; }; dst=${line%%$'\t'*}; src=${line#*$'\t'}; install -m 0755 "$src" "$dst"; echo "> > rolled back $dst"; }
+need install
+case "${1:-}" in apply) shift; apply "$@";; rollback) shift; rollback "$@";; *) usage; exit 2;; esac
