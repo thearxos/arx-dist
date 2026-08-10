@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# ARX 2.3 interactive package selector. Search output is deterministic and
+# preserves exact package names returned by the resolver.
+set -euo pipefail
+
+select_packages() {
+  local query="$1"; shift
+  local -a names=("$@")
+  [ ${#names[@]} -gt 0 ] || { echo ":: No packages found for: $query" >&2; return 1; }
+  if [ ${#names[@]} -eq 1 ]; then printf '%s\n' "${names[0]}"; return 0; fi
+  printf '\n:: Packages matching: %s\n\n' "$query"
+  local i=1 n
+  for n in "${names[@]}"; do printf '%2d) %s\n' "$i" "$n"; i=$((i+1)); done
+  printf '\nSelect package(s) [1-%d, ranges allowed, 0=cancel]: ' "${#names[@]}" >&2
+  local answer; IFS= read -r answer || return 1
+  [ "$answer" != 0 ] || return 130
+  local -A chosen=() token a b x
+  for token in $answer; do
+    if [[ "$token" =~ ^[0-9]+$ ]]; then
+      x=$token; [ "$x" -ge 1 ] && [ "$x" -le "${#names[@]}" ] || { echo "invalid selection: $x" >&2; return 2; }; chosen[$x]=1
+    elif [[ "$token" =~ ^([0-9]+)-([0-9]+)$ ]]; then
+      a=${BASH_REMATCH[1]}; b=${BASH_REMATCH[2]}; [ "$a" -le "$b" ] || { echo "invalid range: $token" >&2; return 2; }; [ "$a" -ge 1 ] && [ "$b" -le "${#names[@]}" ] || return 2
+      for ((x=a;x<=b;x++)); do chosen[$x]=1; done
+    else echo "invalid selection: $token" >&2; return 2; fi
+  done
+  for x in "${!chosen[@]}"; do printf '%s\n' "${names[x-1]}"; done | sort -n -t$'\0' 2>/dev/null || true
+  # Preserve numeric order without relying on NUL sort support.
+  for ((x=1;x<=${#names[@]};x++)); do [ "${chosen[$x]+yes}" ] && printf '%s\n' "${names[x-1]}"; done
+}
+
+if [ "${1:-}" = select ]; then shift; [ $# -ge 2 ] || exit 2; q=$1; shift; select_packages "$q" "$@"; else echo 'usage: arx-select select <query> <package...>'; exit 2; fi
