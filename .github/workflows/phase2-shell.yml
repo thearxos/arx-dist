@@ -1,0 +1,17 @@
+name: ARX Phase 2 shell validation
+on:
+  push:
+    branches: [agent/native-aur-recovery]
+  pull_request:
+
+jobs:
+  shell:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate phase 2 scripts
+        run: |
+          bash -n arx-aur-phase2
+          bash -n arx-aur-phase2.sh
+          bash tests/test-phase2-makepkg.sh
+          bash tests/test-phase2-transaction.sh
