@@ -1,0 +1,97 @@
+#!/usr/bin/env bash
+# ARX Phase 2 transaction/build engine.
+# Keeps makepkg as the trusted Arch builder while adding resumable package state,
+# input fingerprints, safe parallelism, and atomic multi-package installation.
+set -euo pipefail
+
+CACHE=${ARX_AUR_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/arx/aur}
+STATE=${ARX_AUR_STATE:-${XDG_STATE_HOME:-$HOME/.local/state}/arx/aur}
+JOBS=${ARX_AUR_JOBS:-$(nproc 2>/dev/null || echo 2)}
+mkdir -p "$CACHE" "$STATE"
+
+need(){ command -v "$1" >/dev/null 2>&1 || { echo "arx-aur-phase2: missing $1" >&2; exit 127; }; }
+need git; need makepkg; need pacman; need python3; need flock
+
+safe_name(){ [[ "$1" =~ ^[A-Za-z0-9@._+:-]+$ ]]; }
+state_file(){ printf '%s/%s.state' "$STATE" "$1"; }
+get_state(){ local f; f=$(state_file "$1"); [ -f "$f" ] && cat "$f" || echo pending; }
+set_state(){ printf '%s\n' "$2" > "$(state_file "$1")"; }
+
+fingerprint(){
+  local d="$1"
+  {
+    sha256sum "$d/PKGBUILD"
+    find "$d" -maxdepth 1 -type f ! -name PKGBUILD.arx-snapshot -printf '%f\n' | sort | while read -r f; do sha256sum "$d/$f"; done
+    printf 'makepkg=%s\n' "$(makepkg --version 2>/dev/null | head -n1)"
+    printf 'arch=%s\n' "$(uname -m)"
+  } | sha256sum | awk '{print $1}'
+}
+
+prepare(){
+  local p=$1 d="$CACHE/$p" tmp="$CACHE/.${p}.tmp"
+  safe_name "$p" || { echo "invalid package name: $p" >&2; return 2; }
+  exec 9>"$CACHE/.${p}.lock"; flock -n 9 || { echo "$p: build already active" >&2; return 75; }
+  if [ -d "$d/.git" ]; then
+    git -C "$d" fetch --quiet origin master
+    git -C "$d" reset --hard --quiet origin/master
+  else
+    rm -rf "$tmp"
+    git clone --quiet --depth=1 "https://aur.archlinux.org/$p.git" "$tmp"
+    mv "$tmp" "$d"
+  fi
+  [ -f "$d/PKGBUILD" ] || { echo "$p: missing PKGBUILD" >&2; return 1; }
+  printf '%s\n' "$(fingerprint "$d")" > "$d/.arx-input-fingerprint"
+  printf '%s\n' "$d"
+}
+
+build(){
+  local p=$1 d state fp old
+  d=$(prepare "$p")
+  state=$(get_state "$p")
+  fp=$(cat "$d/.arx-input-fingerprint")
+  old=$(cat "$d/.arx-last-built-fingerprint" 2>/dev/null || true)
+
+  case "$state" in
+    installed) [ "$fp" = "$old" ] && { echo ":: $p: already installed and unchanged"; return 0; } ;;
+    built) [ "$fp" = "$old" ] && { echo ":: $p: verified build already exists"; return 0; } ;;
+  esac
+
+  set_state "$p" fetched
+  cp -f "$d/PKGBUILD" "$d/PKGBUILD.arx-snapshot"
+  set_state "$p" verified
+
+  export MAKEFLAGS="-j${JOBS}"
+  export NINJAFLAGS="-j${JOBS}"
+  export ARX_PACKAGE="$p"
+  cd "$d"
+  set_state "$p" building
+  # Verification remains enabled. ARX never supplies --skipinteg/--skippgpcheck.
+  makepkg --syncdeps --cleanbuild --clean --needed
+  set_state "$p" built
+  printf '%s\n' "$fp" > "$d/.arx-last-built-fingerprint"
+}
+
+install_built(){
+  local p=$1 d pkg
+  d="$CACHE/$p"
+  pkg=$(find "$d" -maxdepth 1 -type f -name '*.pkg.tar.*' -printf '%T@ %p\n' | sort -nr | head -n1 | cut -d' ' -f2-)
+  [ -n "$pkg" ] || { echo "$p: no built package found" >&2; return 1; }
+  printf '%s\n' "$pkg"
+}
+
+run(){
+  [ $# -gt 0 ] || { echo 'usage: arx-aur-phase2 install <pkg...>'; return 2; }
+  local p
+  for p in "$@"; do build "$p"; done
+  local -a pkgs=()
+  for p in "$@"; do pkgs+=("$(install_built "$p")"); done
+  # One pacman transaction for the resulting artifact set.
+  sudo pacman -U --needed "${pkgs[@]}"
+  for p in "$@"; do set_state "$p" installed; done
+}
+
+case "${1:-}" in
+ install) shift; run "$@";;
+ status) shift; for p in "$@"; do printf '%s\t%s\n' "$p" "$(get_state "$p")"; done;;
+ *) echo 'usage: arx-aur-phase2 {install|status} <pkg...>'; exit 2;;
+esac
