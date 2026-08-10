@@ -1,0 +1,33 @@
+name: ARX shell tests
+
+on:
+  push:
+    paths:
+      - 'arx'
+      - 'arx-*'
+      - 'install.sh'
+      - 'tests/**'
+      - '.github/workflows/arx-shell-tests.yml'
+  pull_request:
+    paths:
+      - 'arx'
+      - 'arx-*'
+      - 'install.sh'
+      - 'tests/**'
+      - '.github/workflows/arx-shell-tests.yml'
+
+jobs:
+  shell:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Syntax checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash -n arx
+          bash -n arx-aur
+          bash -n arx-front
+          bash -n arx-recover
+          bash -n install.sh
+          bash tests/test-arx-transaction.sh
