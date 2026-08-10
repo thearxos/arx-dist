@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# ARXOS front controller: native AUR routing + bounded transaction recovery.
+# The existing large arx CLI remains the compatibility backend; this layer removes
+# its yay bootstrap path from normal AUR usage and gives package transactions retry semantics.
+set -u -o pipefail
+REAL=/usr/local/lib/arxos/arx-pacman
+AUR=/usr/local/bin/arx-aur
+REC=/usr/local/bin/arx-recover
+
+case "${1:-}" in
+  aur)
+    shift
+    exec "$AUR" install "$@"
+    ;;
+  install|in|i|add)
+    args=("${@:2}")
+    repo=() aur=()
+    for p in "${args[@]}"; do
+      case "$p" in
+        -y|--yes|--noconfirm|--needed) repo+=("$p"); aur+=("$p"); continue;;
+        weaponsCat|weaponscat|weaponCat|weaponcat|weaponsCat-*|weaponCat-*) repo+=("$p"); continue;;
+      esac
+      if command -v pacman >/dev/null 2>&1 && pacman -Si "$p" >/dev/null 2>&1; then repo+=("$p"); else aur+=("$p"); fi
+    done
+    if [ ${#aur[@]} -gt 0 ] && [ ${#repo[@]} -gt 0 ]; then
+      [ ${#repo[@]} -gt 0 ] && "$REC" "$REAL" install "${repo[@]}" || exit $?
+      exec "$REC" "$AUR" install "${aur[@]}"
+    fi
+    if [ ${#aur[@]} -gt 0 ]; then exec "$REC" "$AUR" install "${aur[@]}"; fi
+    exec "$REC" "$REAL" "$@"
+    ;;
+  remove|rm|r|del|uninstall|update|up|upgrade|sync|syu|system|sys|sysupgrade|tools|self|selfupdate|self-update|weapons|arsenal|w)
+    exec "$REC" "$REAL" "$@"
+    ;;
+  *)
+    exec "$REAL" "$@"
+    ;;
+esac
