@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# ARX 2.3 dependency-DAG scheduler. Input format: pkg|dep1,dep2,...
+set -euo pipefail
+[ $# -gt 0 ]||{ echo 'usage: arx-dep-scheduler pkg|dep,... [...]';exit 2; }
+declare -A deps done queued
+for spec in "$@";do IFS='|' read -r p ds<<<"$spec";deps[$p]=${ds:-};done
+while :;do progress=0;remaining=0
+ for p in "${!deps[@]}";do [ "${done[$p]+yes}" ]&&continue;remaining=1;ok=1
+  IFS=',' read -ra a<<<"${deps[$p]}";for d in "${a[@]}";do [ -z "$d" ]&&continue;[ "${done[$d]+yes}" ]||{ ok=0;break;};done
+  if [ "$ok" = 1 ];then printf '%s\n' "$p";done[$p]=1;progress=1;fi
+done
+ [ "$remaining" = 0 ]&&exit 0
+ [ "$progress" = 1 ]||{ echo 'dependency cycle or missing dependency' >&2;exit 3; }
+done
