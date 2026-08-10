@@ -1,12 +1,43 @@
 #!/usr/bin/env bash
 # arx-recover: bounded package transaction retry/repair engine.
 set -u -o pipefail
-MAX_RETRIES=${ARX_RETRIES:-3}; BACKOFF=${ARX_RETRY_BACKOFF:-2}
+MAX_RETRIES=${ARX_RETRIES:-3}; RETRY_BACKOFF=${ARX_RETRY_BACKOFF:-2}
 JOURNAL_DIR=${ARX_JOURNAL_DIR:-/var/lib/arx/transactions}
 mkdir -p "$JOURNAL_DIR" 2>/dev/null || JOURNAL_DIR=${XDG_STATE_HOME:-$HOME/.local/state}/arx/transactions
 mkdir -p "$JOURNAL_DIR"
 say(){ printf 'arx-recover: %s\n' "$*"; }
 classify(){ local f=$1; if grep -qiE 'Could not resolve host|could not resolve|Temporary failure in name resolution|Connection timed out|Connection reset|Failed to connect|Operation too slow|download.*failed|failed retrieving file|SSL.*error' "$f"; then echo network; return; fi; if grep -qiE 'No space left on device|not enough free (disk )?space' "$f"; then echo disk; return; fi; if grep -qiE 'invalid or corrupted package|unexpected error|integrity|checksum' "$f"; then echo cache; return; fi; if grep -qiE 'key.*(unknown|expired|invalid)|invalid signature|signature.*unknown trust|required key missing' "$f"; then echo keyring; return; fi; if grep -qiE 'unable to lock database|could not lock database|database is locked' "$f"; then echo lock; return; fi; if grep -qiE 'conflicting files|conflicts with|could not satisfy dependencies|failed to prepare transaction|unable to satisfy dependency' "$f"; then echo dependency; return; fi; echo unknown; }
 repair(){ case "$1" in network|cache) say 'refreshing package metadata before retry'; sudo pacman -Sy --noconfirm >/dev/null 2>&1 || true;; keyring) say 'refreshing Arch keyring before retry'; sudo pacman -Sy --noconfirm archlinux-keyring >/dev/null 2>&1 || true; sudo pacman-key --populate archlinux >/dev/null 2>&1 || true;; lock) say 'waiting for the active package transaction'; sleep 3;; dependency) say 're-syncing repositories before retry'; sudo pacman -Sy --noconfirm >/dev/null 2>&1 || true;; disk) say 'disk-space failure: refusing destructive automatic cleanup'; return 2;; *) return 1;; esac; }
-run(){ [ $# -gt 0 ] || { say 'usage: arx-recover <command> [args...]'; return 2; }; local id="$(date +%Y%m%d-%H%M%S)-$$" log="$JOURNAL_DIR/$id.log" attempt=1 rc kind; : >"$log"; while :; do say "transaction $id: attempt $attempt/$((MAX_RETRIES+1))"; "$@" > >(tee -a "$log") 2> >(tee -a "$log" >&2); rc=$?; [ $rc -eq 0 ] && { say "transaction $id completed"; return 0; }; kind=$(classify "$log"); say "failure class: $kind"; [ "$attempt" -gt "$MAX_RETRIES" ] && { say "retry budget exhausted; journal: $log"; return $rc; }; repair "$kind"; local rr=$?; [ $rr -eq 2 ] && return $rc; say "retrying after ${BACKOFF}s"; sleep "$BACKOFF"; BACKOFF=$((BACKOFF*2)); attempt=$((attempt+1)); done; }
-if [ "${1:-}" = --classify ]; then shift; classify "$1"; else run "$@"; fi
+run(){
+  [ $# -gt 0 ] || { say 'usage: arx-recover <command> [args...]'; return 2; }
+  local id log attempt rc kind rr backoff
+  id="$(date +%Y%m%d-%H%M%S)-$$"
+  log="$JOURNAL_DIR/$id.log"
+  attempt=1
+  backoff=$RETRY_BACKOFF
+  : >"$log"
+  while :; do
+    say "transaction $id: attempt $attempt/$((MAX_RETRIES+1))"
+    "$@" > >(tee -a "$log") 2> >(tee -a "$log" >&2)
+    rc=$?
+    [ "$rc" -eq 0 ] && { say "transaction $id completed"; return 0; }
+    kind=$(classify "$log")
+    say "failure class: $kind"
+    [ "$attempt" -gt "$MAX_RETRIES" ] && { say "retry budget exhausted; journal: $log"; return "$rc"; }
+    repair "$kind"
+    rr=$?
+    [ "$rr" -eq 2 ] && return "$rc"
+    [ "$rr" -ne 0 ] && { say "failure is not safely repairable; journal: $log"; return "$rc"; }
+    say "retrying after ${backoff}s"
+    sleep "$backoff"
+    backoff=$((backoff*2))
+    attempt=$((attempt+1))
+  done
+}
+if [ "${1:-}" = --classify ]; then
+  shift
+  [ $# -eq 1 ] || { say 'usage: arx-recover --classify <log>'; exit 2; }
+  classify "$1"
+else
+  run "$@"
+fi
