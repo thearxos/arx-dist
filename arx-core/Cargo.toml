@@ -1,0 +1,25 @@
+[package]
+name = "arx-core"
+version = "0.1.0"
+edition = "2021"
+description = "ARXOS native package-manager core: libalpm sync/query + AUR malware scan. The hot path for arx; bash stays the orchestrator."
+license = "GPL-3.0-or-later"
+
+[[bin]]
+name = "arx-core"
+path = "src/main.rs"
+
+# `generate` bindgens the installed /usr/include/alpm.h so the FFI matches whatever
+# libalpm the system ships (pacman 7.1 -> libalpm 16), instead of pinning to a
+# pregenerated ABI that could silently mismatch at runtime.
+[dependencies]
+alpm = { version = "4", features = ["generate"] }
+alpm-utils = "4"
+pacmanconf = "3"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
