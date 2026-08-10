@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# ARX Phase 2.1 resource-aware build scheduler.
+set -euo pipefail
+
+ARX_CPU_JOBS=${ARX_CPU_JOBS:-$(nproc 2>/dev/null || echo 2)}
+ARX_MAX_RAM_MB=${ARX_MAX_RAM_MB:-0}
+ARX_MIN_FREE_MB=${ARX_MIN_FREE_MB:-2048}
+ARX_BUILD_RAM_MB=${ARX_BUILD_RAM_MB:-1024}
+ARX_MAX_JOBS=${ARX_MAX_JOBS:-$ARX_CPU_JOBS}
+
+mem_available_mb(){ awk '/MemAvailable:/ {print int($2/1024); exit}' /proc/meminfo 2>/dev/null || echo 0; }
+free_disk_mb(){ local p=${1:-.}; df -Pm "$p" | awk 'NR==2 {print $4}'; }
+calc_jobs(){
+  local cpu="$ARX_CPU_JOBS" ram avail disk jobs
+  avail=$(mem_available_mb)
+  disk=$(free_disk_mb "${1:-.}")
+  jobs=$cpu
+  [ "$ARX_MAX_JOBS" -lt "$jobs" ] && jobs=$ARX_MAX_JOBS
+  if [ "$ARX_MAX_RAM_MB" -gt 0 ] && [ "$avail" -gt 0 ]; then
+    ram=$((avail / ARX_BUILD_RAM_MB))
+    [ "$ram" -lt "$jobs" ] && jobs=$ram
+  fi
+  [ "$disk" -lt "$ARX_MIN_FREE_MB" ] && jobs=0
+  [ "$jobs" -lt 1 ] && jobs=1
+  printf '%s\n' "$jobs"
+}
+
+case "${1:-}" in
+  jobs) shift; calc_jobs "${1:-.}";;
+  check) shift; d=$(free_disk_mb "${1:-.}"); m=$(mem_available_mb); printf 'cpu=%s\nram_available_mb=%s\nfree_disk_mb=%s\nrecommended_jobs=%s\n' "$ARX_CPU_JOBS" "$m" "$d" "$(calc_jobs "${1:-.}")";;
+  *) echo 'usage: arx-resource-scheduler {jobs|check} [path]' >&2; exit 2;;
+esac
