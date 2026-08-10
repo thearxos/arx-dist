@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# ARX 2.2 historical resource estimator.
+set -euo pipefail
+LOG=${ARX_RESOURCE_LOG:-${XDG_STATE_HOME:-$HOME/.local/state}/arx/aur/resources.log}
+
+estimate(){
+  local p=$1 default=${ARX_BUILD_RAM_MB:-1024}
+  [ -f "$LOG" ] || { echo "$default"; return; }
+  awk -v p="$p" -v d="$default" '$2==p && $3>0 {sum+=$3; n++} END {if(n) {v=int(sum/n); if(v<256)v=256; print v} else print d}' "$LOG"
+}
+case "${1:-}" in
+  ram) [ $# -eq 2 ] || { echo 'usage: arx-resource-history ram <pkg>'; exit 2; }; estimate "$2";;
+  *) echo 'usage: arx-resource-history ram <pkg>'; exit 2;;
+esac
