@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# arx-front: frontend for arx
+set -euo pipefail
+
+echo "arx-front placeholder"

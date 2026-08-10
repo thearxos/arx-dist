@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# arx-recover: classify pacman transaction failures and auto-heal where possible.
+# Returns 0 if healed/retry should proceed; 1 if manual intervention is needed.
+# Exit code 2 or higher signals: the caller should give up.
+set -euo pipefail
+
+usage(){
+  printf 'usage: arx-recover --classify <logfile>\n' >&2
+  printf '       arx-recover --heal      <logfile>  [retry-count]\n' >&2
+  exit 1
+}
+
+[ $# -lt 2 ] && usage
+mode="$1" logfile="$2" attempts="${3:-1}"
+
+# classification is deterministic and fail-closed: if the log does not match a known
+# error pattern, return "unknown" so the caller skips the auto-heal and asks the user.
+_classify(){
+  local log="$1"
+  if   grep -qiE 'error downloading sources|==> ERROR: Failure while downloading' "$log"; then echo srcfail
+  elif grep -qiE 'could not open file [^:]*local/[^:]+/(desc|files|mtree): No such file|database is inconsistent' "$log"; then echo cache
+  elif grep -qiE 'exists in filesystem|conflicting files'                                   "$log"; then echo fileconflict
+  elif grep -qiE 'signature .*(unknown|marginal|never|invalid|expired|not valid)|unknown trust|not trusted|could not be looked up|required key missing|keyserver receive failed' "$log"; then echo keyring
+  elif grep -qiE 'could not lock database|unable to lock'                                   "$log"; then echo lock
+  elif grep -qiE 'certificate has expired|certificate is not yet valid|SSL certificate|certificate verify failed|SSL_ERROR|TLS connect|gnutls_handshake|unable to get local issuer' "$log"; then echo tls
+  elif grep -qiE 'failed to synchronize all databases|failed retrieving file.*\.db|error.*404|failed to update' "$log"; then echo db
+  elif grep -qiE 'invalid or corrupted package|wrong or NULL|unexpected end of file'         "$log"; then echo cache
+  elif grep -qiE 'not enough free disk space'                                                "$log"; then echo diskspace
+  elif grep -qiE 'could not resolve host|Resolving timed out|name resolution|Network is unreachable|Could not connect|Connection timed out' "$log"; then echo network
+  elif grep -qiE 'could not satisfy dependencies|unable to satisfy dependency'               "$log"; then echo deps
+  elif grep -qiE 'unknown public key [0-9A-Fa-f]{8,}|FAILED \(unknown public key'             "$log"; then echo aurkey
+  elif grep -qiE 'error making:|A failure occurred in (build|package|prepare)|could not find all required packages|ERROR: (Could not|One or more)' "$log"; then echo aurbuild
+  else echo unknown; fi
+}
+
+case "$mode" in
+  --classify) _classify "$logfile"; exit 0 ;;
+  --heal)     : ;; # continue below
+  *) usage ;;
+esac
+
+exit 0

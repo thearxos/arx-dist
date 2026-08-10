@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# arx-aur: AUR helper wrapper
+set -euo pipefail
+
+echo "arx-aur placeholder"
