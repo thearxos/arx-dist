@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# ARX 2.2 bounded build queue. Packages are queued once and workers are
+# constrained by the scheduler's current resource budget.
+set -euo pipefail
+ROOT=$(dirname "$0")
+WORKER=${ARX_BUILD_WORKER:-"$ROOT/arx-build-worker"}
+MAX=${ARX_MAX_JOBS:-$(nproc 2>/dev/null||echo 2)}
+
+[ $# -gt 0 ] || { echo 'usage: arx-build-queue <pkg...>'; exit 2; }
+
+pids=()
+wait_one(){
+  local pid=$1
+  wait "$pid"
+}
+
+for pkg in "$@"; do
+  while :; do
+    running=0
+    for pid in "${pids[@]}"; do kill -0 "$pid" 2>/dev/null && running=$((running+1)) || true; done
+    [ "$running" -lt "$MAX" ] && break
+    for pid in "${pids[@]}"; do if ! kill -0 "$pid" 2>/dev/null; then wait "$pid"; pids=("${pids[@]/$pid}"); break; fi; done
+    sleep 0.2
+  done
+  "$WORKER" build "$pkg" &
+  pids+=("$!")
+done
+status=0
+for pid in "${pids[@]}"; do wait "$pid" || status=$?; done
+exit "$status"
