@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+set -euo pipefail
+ROOT=$(dirname "$0");CACHE=${ARX_AUR_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/arx/aur};STATE=${ARX_AUR_STATE:-${XDG_STATE_HOME:-$HOME/.local/state}/arx/aur};SCHED=${ARX_RESOURCE_SCHEDULER:-"$ROOT/arx-resource-scheduler"};mkdir -p "$CACHE" "$STATE"
+sf(){ printf '%s/%s.state' "$STATE" "$1"; };ss(){ printf '%s\n' "$2">"$(sf "$1")"; };safe(){ [[ "$1" =~ ^[A-Za-z0-9@._+:-]+$ ]]; }
+run(){ local p=$1 d="$CACHE/$1" j;safe "$p"||return 2;[ -f "$d/PKGBUILD" ]||return 1;exec 9>"$CACHE/.$p.build.lock";flock -n 9||return 75;j=$($SCHED jobs "$d");export MAKEFLAGS="-j$j" NINJAFLAGS="-j$j";ss "$p" building;cd "$d";makepkg --syncdeps --cleanbuild --clean --needed;ss "$p" built; }
+[ "${1:-}" = build ]&&{ shift;[ $# -eq 1 ]||exit 2;run "$1";exit $?; };echo 'usage: arx-build-worker build <pkg>' >&2;exit 2

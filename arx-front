@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+set -u -o pipefail
+REAL=/usr/local/lib/arxos/arx-pacman; AUR=/usr/local/bin/arx-aur; REC=/usr/local/bin/arx-recover; WEAP=/usr/local/bin/arx-weapons
+
+# ARX 0.1.1 front controller. Full pacman-style flags are preserved and
+# forwarded to the compatibility backend; readable aliases normalize to them.
+case "${1:-}" in --version|-V) printf '%s\n' 'arx 0.1.1 (ARXOS)'; exit 0 ;; esac
+_normalize_flag(){
+  local a="${1:-}" l="${1,,}"
+  case "$l" in
+    -sync|--sync) printf '%s' '-S' ;;
+    -remove|--remove) printf '%s' '-R' ;;
+    -upgrade|--upgrade) printf '%s' '-U' ;;
+    -database|--database) printf '%s' '-D' ;;
+    -query|--query) printf '%s' '-Q' ;;
+    -files|--files) printf '%s' '-F' ;;
+    -deptest|--deptest) printf '%s' '-T' ;;
+    -version|--version) printf '%s' '-V' ;;
+    -search|--search) printf '%s' 'search' ;;
+    -info|--info) printf '%s' 'info' ;;
+    -clean|--clean) printf '%s' 'clean' ;;
+    -orphans|--orphans) printf '%s' 'orphans' ;;
+    -outdated|--outdated) printf '%s' 'outdated' ;;
+    -mirrors|--mirrors|-mirror|--mirror) printf '%s' 'mirrors' ;;
+    *) printf '%s' "$a" ;;
+  esac
+}
+
+if [ $# -gt 0 ]; then
+  _n=$(_normalize_flag "$1")
+  [ "$1" != "$_n" ] && set -- "$_n" "${@:2}"
+fi
+
+case "${1:-}" in
+ aur) shift; exec "$AUR" install "$@";;
+ install|in|i|add)
+  args=("${@:2}")
+  case "${args[0]:-}" in weaponsCat|weaponscat|weaponCat|weaponcat|weaponsCat-*|weaponCat-*) exec "$REC" "$WEAP" install "${args[@]}";; esac
+  repo=() aur=()
+  for p in "${args[@]}"; do
+    case "$p" in -y|--yes|--noconfirm|--needed) repo+=("$p"); aur+=("$p"); continue;; esac
+    if command -v pacman >/dev/null 2>&1 && pacman -Ssq "^${p//./\\.}$" 2>/dev/null | grep -qx "$p"; then repo+=("$p"); else aur+=("$p"); fi
+  done
+  if [ ${#aur[@]} -gt 0 ] && [ ${#repo[@]} -gt 0 ]; then "$REC" "$REAL" install "${repo[@]}" || exit $?; exec "$REC" "$AUR" install "${aur[@]}"; fi
+  [ ${#aur[@]} -gt 0 ] && exec "$REC" "$AUR" install "${aur[@]}"
+  exec "$REC" "$REAL" "$@";;
+ update|up|upgrade)
+  shift
+  "$REC" "$REAL" system "$@" || exit $?
+  exec "$REC" "$AUR" upgrade "$@";;
+ remove|rm|r|del|uninstall|sync|syu|system|sys|sysupgrade|tools|self|selfupdate|self-update|weapons|arsenal|w) exec "$REC" "$REAL" "$@";;
+ *) exec "$REAL" "$@";;
+esac

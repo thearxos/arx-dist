@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+set -euo pipefail
+q=${1:-};shift||true;[ -n "$q" ]&&[ $# -gt 0 ]||exit 2
+if [ $# -eq 1 ];then printf '%s\n' "$1";exit 0;fi
+printf '\n:: Packages matching: %s\n\n' "$q" >&2;i=1;for n in "$@";do printf '%2d) %s\n' "$i" "$n" >&2;i=$((i+1));done
+printf '\nSelect package(s) [1-%d, ranges allowed, 0=cancel]: ' "$#" >&2;read -r ans||exit 1;[ "$ans" != 0 ]||exit 130
+declare -A c=();for t in $ans;do if [[ $t =~ ^[0-9]+$ ]];then [ $t -ge 1 ]&&[ $t -le $# ]||exit 2;c[$t]=1;elif [[ $t =~ ^([0-9]+)-([0-9]+)$ ]];then a=${BASH_REMATCH[1]};b=${BASH_REMATCH[2]};[ $a -le $b ]&&[ $a -ge 1 ]&&[ $b -le $# ]||exit 2;for((i=a;i<=b;i++));do c[$i]=1;done;else exit 2;fi;done
+for((i=1;i<=$#;i++));do [ "${c[$i]+x}" ]&&printf '%s\n' "${!i}";done

@@ -1,0 +1,95 @@
+#!/usr/bin/env bash
+# ARXOS-native AUR client for ARX 0.1.1. No yay/paru runtime dependency.
+set -euo pipefail
+AUR_RPC=${ARX_AUR_RPC:-https://aur.archlinux.org/rpc/v5}
+AUR_CACHE=${ARX_AUR_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/arx/aur}
+ASSUME_YES=0
+_die(){ printf 'arx-aur: error: %s\n' "$*" >&2; exit 1; }
+_have(){ command -v "$1" >/dev/null 2>&1 || _die "required command not found: $1"; }
+for _x in curl git makepkg python3 flock pacman; do _have "$_x"; done
+mkdir -p "$AUR_CACHE"
+
+case "${1:-}" in --version|-V) printf '%s\n' 'arx-aur 0.1.1 (ARXOS)'; exit 0 ;; esac
+rpc(){ curl --fail --silent --show-error --retry 3 --retry-delay 1 --connect-timeout 5 --max-time 20 -H 'Accept: application/json' "$AUR_RPC/$1"; }
+search(){
+  [ $# -gt 0 ] || _die 'usage: arx-aur search <term>'
+  local q; q=$(python3 -c 'import urllib.parse,sys; print(urllib.parse.quote(" ".join(sys.argv[1:])))' "$@")
+  rpc "search?by=name-desc&arg=$q" | python3 -c 'import json,sys
+x=json.load(sys.stdin)
+for r in x.get("results",[]): print(f"{r.get(\"Name\",\"\"):<30} {r.get(\"Version\",\"\"):<20} {r.get(\"NumVotes\",0):>8}  {(r.get(\"Description\") or \"\").replace(chr(10),\" \")}")'
+}
+info(){
+  [ $# -gt 0 ] || _die 'usage: arx-aur info <pkg>'
+  local p j; for p in "$@"; do
+    j=$(rpc "info?arg=$(python3 -c 'import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))' "$p")") || continue
+    printf '%s\n' "$j" | python3 -c 'import json,sys
+r=(json.load(sys.stdin).get("results") or [None])[0]
+if not r: sys.exit(1)
+for k in ("Name","Version","Description","URL","Maintainer","FirstSubmitted","LastModified","NumVotes","Popularity","OutOfDate"): print(f"{k}: {r.get(k,\"\")}")'
+  done
+}
+build_one(){
+  local pkg=$1 root="$AUR_CACHE/$1" lock="$AUR_CACHE/.${1}.lock"
+  mkdir -p "$AUR_CACHE"; exec 9>"$lock"; flock -n 9 || _die "$pkg is already being built by another arx process"
+  if [ -d "$root/.git" ]; then git -C "$root" fetch --quiet origin master && git -C "$root" reset --hard --quiet origin/master; else rm -rf "$root.tmp"; git clone --quiet --depth=1 "https://aur.archlinux.org/$pkg.git" "$root.tmp"; mv "$root.tmp" "$root"; fi
+  [ -f "$root/PKGBUILD" ] || _die "$pkg: AUR repository has no PKGBUILD"
+  cp -f "$root/PKGBUILD" "$root/PKGBUILD.arx-snapshot"
+  local -a args=(--syncdeps --install --needed); [ "$ASSUME_YES" -eq 1 ] && args+=(--noconfirm)
+  cd "$root"; makepkg "${args[@]}"
+}
+install_pkgs(){ local p; [ $# -gt 0 ] || _die 'no package specified'; for p in "$@"; do [[ "$p" =~ ^[A-Za-z0-9@._+:-]+$ ]] || _die "invalid AUR package name: $p"; build_one "$p"; done; }
+upgrade(){
+  local changed=1 p cur remote j
+  while IFS=$'\t' read -r p cur remote; do
+    [ -n "$p" ] || continue
+    [ "$cur" != "$remote" ] || continue
+    changed=0
+    install_pkgs "$p"
+  done < <(
+    pacman -Qqm 2>/dev/null | while read -r p; do
+      [ -n "$p" ] || continue
+      cur=$(pacman -Q "$p" | awk '{print $2}')
+      j=$(rpc "info?arg=$(python3 -c 'import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))' "$p")" 2>/dev/null) || continue
+      remote=$(printf '%s\n' "$j" | python3 -c 'import json,sys; print((json.load(sys.stdin).get("results") or [{}])[0].get("Version", ""))')
+      [ -n "$remote" ] && printf '%s\t%s\t%s\n' "$p" "$cur" "$remote"
+    done
+  )
+  [ "$changed" -eq 1 ] && return 0
+  echo 'arx-aur: no AUR updates available'
+}
+remove(){
+  [ $# -gt 0 ] || _die 'usage: arx-aur remove <pkg...>'
+  pacman -Rns --noconfirm "$@"
+}
+clean(){
+  rm -rf "$AUR_CACHE"/* "$AUR_CACHE"/.[!.]* "$AUR_CACHE"/..?* 2>/dev/null || true
+  mkdir -p "$AUR_CACHE"
+  pacman -Sc --noconfirm
+}
+sync(){ pacman -Sy --noconfirm; }
+help(){
+  cat <<'EOF'
+usage: arx-aur <command> [options] [package...]
+
+Commands:
+  search, s              Search the AUR
+  info, i                Show AUR package metadata
+  install, -S            Build and install AUR packages with makepkg + pacman
+  upgrade, up            Upgrade installed AUR packages
+  remove, rm, -R         Remove packages with pacman
+  clean, cc              Clean AUR build cache and pacman cache
+  sync, -Sy              Refresh pacman package databases
+  --version, -V          Show ARX AUR helper version
+EOF
+}
+case "${1:-}" in
+  search|s) shift; search "$@";;
+  info|i) shift; info "$@";;
+  install|-S) shift; while [ $# -gt 0 ]; do case "$1" in -y|--yes|--noconfirm|--needed) ASSUME_YES=1; shift;; *) break;; esac; done; install_pkgs "$@";;
+  upgrade|up|-Su|-Sua) shift; upgrade "$@";;
+  remove|rm|-R) shift; remove "$@";;
+  clean|cc) clean;;
+  sync|-Sy) sync;;
+  -h|--help|'') help;;
+  *) _die "unknown command: $1";;
+esac

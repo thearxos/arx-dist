@@ -1,0 +1,98 @@
+#!/usr/bin/env python3
+# arxos-askpass - a SUDO_ASKPASS helper: an ArxOS-styled GTK password dialog.
+# sudo -A calls this with the prompt as argv[1]; we print the password to stdout
+# (exit 0) or exit 1 on cancel. Lets GUI tools escalate with a real password prompt.
+import gi, sys, os, time, random
+gi.require_version("Gtk", "3.0")
+from gi.repository import Gtk, Gdk, GLib
+
+AC = "#e8702a"
+PROMPT = " ".join(sys.argv[1:]).strip() or "Authentication is required"
+
+def _badpass():
+    # sudo -A launches this fresh for every attempt, so a short-lived per-user state file
+    # tells us this is a retry (the last password was wrong) -> roast the user with one of
+    # our own messages. First attempt returns None (a normal prompt).
+    f = "/tmp/.arxos-askpass-%d" % os.getuid()
+    now, n = time.time(), 0
+    try:
+        prev, ts = open(f).read().split()
+        if now - float(ts) < 90: n = int(prev)
+    except Exception: pass
+    n += 1
+    try: open(f, "w").write("%d %f" % (n, now))
+    except Exception: pass
+    if n < 2: return None
+    try: pool = [l.strip() for l in open("/usr/share/arxos/badpass.txt") if l.strip()]
+    except Exception: pool = ["nah that ain't it, run it back"]
+    return random.choice(pool) if pool else None
+
+ROAST = _badpass()
+
+CSS = ("""
+window { background:#0c0c0e; }
+.t { color:#fff; font-weight:800; font-size:15px; }
+.p { color:#9a9a9f; font-size:12px; }
+.roast { color:%(a)s; font-size:12.5px; font-weight:700; }
+entry { background:#050506; color:#fff; border:1px solid rgba(232,112,42,.35);
+        border-radius:10px; padding:9px 12px; }
+entry:focus { border-color:%(a)s; box-shadow:0 0 0 3px rgba(232,112,42,.16); }
+button { border-radius:9px; padding:7px 16px; font-weight:600; }
+button.ok { background:%(a)s; color:#fff; border:0; }
+button.ok:hover { background:#d2611f; }
+""" % {"a": AC}).encode()
+
+
+class Ask(Gtk.Window):
+    def __init__(self):
+        super().__init__(title="ArxOS")
+        self.set_position(Gtk.WindowPosition.CENTER); self.set_default_size(380, -1)
+        self.set_keep_above(True); self.set_modal(True); self.set_decorated(True)
+        try: self.set_icon_name("system-lock-screen")
+        except Exception: pass
+        p = Gtk.CssProvider(); p.load_from_data(CSS)
+        Gtk.StyleContext.add_provider_for_screen(Gdk.Screen.get_default(), p, Gtk.STYLE_PROVIDER_PRIORITY_USER)
+
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        for m in ("set_margin_top", "set_margin_bottom", "set_margin_start", "set_margin_end"): getattr(box, m)(22)
+        self.add(box)
+
+        t = Gtk.Label(); t.set_markup("Arx<span foreground='%s'>OS</span>  ·  authentication" % AC)
+        t.set_xalign(0); t.get_style_context().add_class("t"); box.pack_start(t, False, False, 0)
+        sub = Gtk.Label(); sub.set_xalign(0); sub.set_line_wrap(True)
+        if ROAST:
+            sub.set_markup("<span foreground='%s'>%s</span>" % (AC, GLib.markup_escape_text(ROAST)))
+            sub.get_style_context().add_class("roast")
+        else:
+            sub.set_label(PROMPT); sub.get_style_context().add_class("p")
+        box.pack_start(sub, False, False, 0)
+
+        self.e = Gtk.Entry(); self.e.set_visibility(False); self.e.set_placeholder_text("Password")
+        try: self.e.set_invisible_char("*")
+        except Exception: pass
+        self.e.set_activates_default(True); self.e.connect("activate", self._ok)
+        box.pack_start(self.e, False, False, 4)
+
+        row = Gtk.Box(spacing=8); row.set_halign(Gtk.Align.END)
+        cancel = Gtk.Button(label="Cancel"); cancel.connect("clicked", self._cancel)
+        ok = Gtk.Button(label="Authenticate"); ok.get_style_context().add_class("ok")
+        ok.connect("clicked", self._ok); ok.set_can_default(True)
+        row.pack_start(cancel, False, False, 0); row.pack_start(ok, False, False, 0)
+        box.pack_start(row, False, False, 0)
+        self.connect("key-press-event", self._key)
+        self.connect("destroy", lambda *_: self._cancel())
+        self.show_all(); ok.grab_default(); self.e.grab_focus()
+
+    def _ok(self, *_):
+        sys.stdout.write(self.e.get_text()); sys.stdout.flush()
+        Gtk.main_quit(); sys.exit(0)
+
+    def _cancel(self, *_):
+        Gtk.main_quit(); sys.exit(1)
+
+    def _key(self, _w, ev):
+        if ev.keyval == Gdk.KEY_Escape: self._cancel()
+
+
+if __name__ == "__main__":
+    Ask(); Gtk.main(); sys.exit(1)
