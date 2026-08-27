@@ -1,5 +1,0 @@
-#!/usr/bin/env bash
-# ARX Weapons repository lifecycle manager.
-set -u -o pipefail
-CONF=${ARX_PACMAN_CONF:-/etc/pacman.conf};MARKER=${ARX_WEAPONS_MARKER:-/var/lib/arx/weapons-repo.enabled};STRAP=${ARX_WEAPONS_STRAP:-/usr/share/arxos/weapons/blackarch/strap.sh};BACKUP=${ARX_WEAPONS_CONF_BACKUP:-/var/lib/arx/weapons-pacman.conf}
-exists(){ grep -qE '^\[blackarch(|-[^]]+)\]' "$CONF" 2>/dev/null; };enabled(){ awk '/^\[blackarch/{x=1;next}/^\[/{x=0}x&&/^[[:space:]]*Server[[:space:]]*=/{print;exit}' "$CONF"|grep -qv '^#'; };backup(){ [ -f "$BACKUP" ]||sudo cp -a "$CONF" "$BACKUP"; };disable(){ exists||return 0;backup;sudo sed -i -E 's/^([[:space:]]*Server[[:space:]]*=)/# ARX-DORMANT \1/' "$CONF";rm -f "$MARKER"; };enable(){ exists||{ [ -x "$STRAP" ]||return 2;sudo "$STRAP" --no-confirm >/dev/null 2>&1||return 1; };sudo sed -i -E 's/^# ARX-DORMANT[[:space:]]+//' "$CONF";sudo mkdir -p "$(dirname "$MARKER")";sudo touch "$MARKER"; };case "${1:-}" in enable)enable;;disable)disable;;status)enabled&&echo enabled||echo dormant;;*)echo 'usage: arx-weapons-repo {enable|disable|status}';exit 2;;esac
